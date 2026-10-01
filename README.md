@@ -1,0 +1,181 @@
+# iPhone Stock Watch — Apple Store Hong Kong
+
+Присылает уведомление в **Telegram**, когда iPhone 18 Pro Max появляется для **самовывоза (Pick up) в любом Apple Store Гонконга**. Основано на проекте [therijalclub-jpg/iphone-stock-watch](https://github.com/therijalclub-jpg/iphone-stock-watch) (Apple UK, уведомления на почту), переделано под apple.com/hk и Telegram.
+
+## Что отслеживается
+
+**iPhone 18 Pro Max 512GB, 1TB и 2TB во всех четырёх цветах** — 12 конфигураций. Артикулы гонконгские (`…ZA/A`), британские (`…QN/A`) в Гонконге не продаются. Цены — на 2 октября 2026.
+
+| Память | Silver | Black | Glacier | Burgundy | Цена |
+|---|---|---|---|---|---|
+| 512GB | MJXU4ZA/A | MJXT4ZA/A | MJXW4ZA/A | MJXV4ZA/A | HK$13,299 |
+| 1TB | MJXY4ZA/A | MJXX4ZA/A | MJY14ZA/A | MJY04ZA/A | HK$16,799 |
+| 2TB | MJY34ZA/A | MJY24ZA/A | MJY54ZA/A | MJY44ZA/A | HK$21,999 |
+
+Все 12 проверяются одним запросом во всех 6 магазинах Apple в Гонконге:
+
+| Магазин | Район | Номер |
+|---|---|---|
+| Apple ifc mall | Central | R428 |
+| Apple Causeway Bay | Causeway Bay | R409 |
+| Apple Canton Road | Tsim Sha Tsui | R499 |
+| Apple Festival Walk | Kowloon Tong | R485 |
+| Apple apm Hong Kong | Kwun Tong | R673 |
+| Apple New Town Plaza | Sha Tin | R610 |
+
+GitHub Action запускается каждые 5 минут (минимум для расписаний GitHub) и за один запуск проверяет наличие 5 раз с интервалом в минуту.
+
+Когда конфигурация появляется в магазине, где её не было, приходит одно сообщение. Пока она там остаётся, сообщение не повторяется. Пример:
+
+```
+🟢 В наличии: iPhone 18 Pro Max 1TB Black и ещё 1
+
+iPhone 18 Pro Max 1TB Black
+• Apple Canton Road, Tsim Sha Tsui — Available Today
+• Apple ifc mall, Central — Available Today
+Оформить самовывоз
+
+iPhone 18 Pro Max 2TB Silver
+• Apple Festival Walk, Kowloon Tong — Available Today
+Оформить самовывоз
+
+Apple Store Hong Kong · проверено 2026-10-02 14:07:12 HKT
+```
+
+«Оформить самовывоз» — ссылка прямо на эту конфигурацию на apple.com/hk.
+
+## 1. Создайте Telegram-бота
+
+1. В Telegram откройте **@BotFather**, отправьте `/newbot`, придумайте имя и username (должен заканчиваться на `bot`). BotFather пришлёт токен вида `123456789:AAH…`.
+2. Откройте своего бота по ссылке от BotFather и нажмите **Start** — без этого бот не сможет вам писать.
+3. Узнайте chat ID:
+
+   ```bash
+   python3 telegram_setup.py
+   ```
+
+   Скрипт спросит токен, найдёт ваш чат и пришлёт в него подтверждение. Символы при вводе не отображаются: вставьте токен один раз (`Cmd + V`) и сразу нажмите Enter. Нужен только Python 3, сторонние библиотеки не нужны.
+
+   Без скрипта: откройте в браузере `https://api.telegram.org/bot<ТОКЕН>/getUpdates` и найдите `"chat":{"id":123456789`.
+
+Чтобы уведомления приходили в группу, добавьте туда бота, напишите в группе любое сообщение и снова запустите `telegram_setup.py` — у группы chat ID отрицательный. Несколько получателей — через запятую.
+
+Токен бота — это пароль: не коммитьте его в репозиторий.
+
+## 2. Создайте репозиторий
+
+Рекомендуется **публичный** репозиторий: в публичных репозиториях стандартные GitHub Actions бесплатны и без лимита минут. В приватном бесплатных 2000 минут в месяц хватит примерно на неделю. Токен в файлы не кладите — только в секреты (шаг 3).
+
+Создайте на github.com пустой репозиторий (без README и .gitignore) и загрузите в него все файлы этой папки, включая `.github/workflows/`.
+
+Через терминал:
+
+```bash
+cd ~/iPhone_Checker
+git init -b main
+git add .
+git commit -m "Apple Store Hong Kong stock watch"
+git remote add origin https://github.com/<ваш-логин>/<имя-репозитория>.git
+git push -u origin main
+```
+
+Или через сайт: **Add file → Upload files** и перетащите содержимое папки. Finder скрывает папку `.github` — нажмите `Cmd + Shift + .`, чтобы её увидеть. Без неё ничего запускаться не будет.
+
+## 3. Добавьте секреты GitHub Actions
+
+В репозитории: **Settings → Secrets and variables → Actions → Secrets → New repository secret**
+
+- `TELEGRAM_BOT_TOKEN` — токен бота от @BotFather
+- `TELEGRAM_CHAT_ID` — ваш chat ID из шага 1 (несколько — через запятую)
+
+## 4. Проверьте
+
+1. **Actions → Test Telegram Alert → Run workflow.** В Telegram придёт тестовое сообщение с текущим наличием всех 12 конфигураций.
+2. **Actions → iPhone Stock Watch (Apple Store Hong Kong) → Run workflow.** В логе шага «Check Apple Store Hong Kong pickup stock» появятся строки вида:
+
+   ```
+   [2026-10-02 06:50:41 HKT] Check 1/5: 6 stores × 12 models checked — no pickup stock
+   ```
+
+Если товара нет, запуск завершается без сообщения.
+
+Если Apple заблокирует запросы или изменит API, запуск упадёт с ошибкой, а не сообщит ложное «нет в наличии». Расписание начинает работать, только когда файлы workflow лежат в основной ветке (`main`).
+
+GitHub сам пишет на почту об упавших запусках. Если эти письма не нужны, на github.com/settings/notifications в разделе **System → Actions** снимите **Email**: о сбоях и так сообщит Telegram (см. ниже).
+
+## Если проверка сломалась
+
+Если проверки не проходят дольше 30 минут подряд (Apple блокирует запросы, изменил API или в `PART_NUMBERS` неверный артикул), бот один раз пришлёт «⚠️ Проверка наличия … не работает» со ссылкой на лог запуска. Когда всё восстановится, придёт «✅ … снова работает». Короткие сбои не сообщаются.
+
+Если не приходит даже тестовое сообщение, ошибка видна в логе Test Telegram Alert:
+
+| Ошибка | Что сделать |
+|---|---|
+| `HTTP 401 Unauthorized` | Неверный или отозванный `TELEGRAM_BOT_TOKEN` |
+| `HTTP 404 Not Found` или `TELEGRAM_BOT_TOKEN is malformed` | Токен вставлен с лишними или недостающими символами — скопируйте его заново |
+| `Bad Request: chat not found` | Неверный `TELEGRAM_CHAT_ID` |
+| `Forbidden: bot can't initiate conversation with a user` | Откройте бота и нажмите Start |
+
+## Другие модели и частота проверок
+
+Всё настраивается без правки кода: **Settings → Secrets and variables → Actions → Variables → New repository variable**
+
+| Переменная | По умолчанию | Что делает |
+|---|---|---|
+| `PART_NUMBERS` | 12 конфигураций выше | Свой список артикулов через запятую, например `MJXU4ZA/A,MJXT4ZA/A`. Apple отдаёт не больше 20 артикулов за запрос; если указать больше, скрипт сам разобьёт их на несколько запросов. |
+| `CHECKS_PER_RUN` | `5` | Сколько проверок за один запуск. `1` — как в оригинале. |
+| `CHECK_INTERVAL_SECONDS` | `60` | Пауза между проверками, не меньше 10 секунд. |
+
+`CHECKS_PER_RUN × CHECK_INTERVAL_SECONDS` держите в пределах ~10 минут: задача ограничена 15 минутами.
+
+### Артикулы iPhone 18 Pro и 18 Pro Max для Гонконга
+
+| Модель | Память | Silver | Black | Glacier | Burgundy | Цена |
+|---|---|---|---|---|---|---|
+| iPhone 18 Pro | 256GB | MJRQ4ZA/A | MJRP4ZA/A | MJRT4ZA/A | MJRR4ZA/A | HK$10,499 |
+| iPhone 18 Pro | 512GB | MJRV4ZA/A | MJRU4ZA/A | MJRX4ZA/A | MJRW4ZA/A | HK$12,299 |
+| iPhone 18 Pro | 1TB | MJT04ZA/A | MJRY4ZA/A | MJT24ZA/A | MJT14ZA/A | HK$15,799 |
+| iPhone 18 Pro | 2TB | MJT44ZA/A | MJT34ZA/A | MJT64ZA/A | MJT54ZA/A | HK$20,999 |
+| iPhone 18 Pro Max | 256GB | MJXP4ZA/A | MJXN4ZA/A | MJXR4ZA/A | MJXQ4ZA/A | HK$11,499 |
+| iPhone 18 Pro Max | 512GB | MJXU4ZA/A | MJXT4ZA/A | MJXW4ZA/A | MJXV4ZA/A | HK$13,299 |
+| iPhone 18 Pro Max | 1TB | MJXY4ZA/A | MJXX4ZA/A | MJY14ZA/A | MJY04ZA/A | HK$16,799 |
+| iPhone 18 Pro Max | 2TB | MJY34ZA/A | MJY24ZA/A | MJY54ZA/A | MJY44ZA/A | HK$21,999 |
+
+Артикулы других моделей выводит `find_parts.py`:
+
+```bash
+python3 find_parts.py iphone-air
+```
+
+Вместо `iphone-air` подставьте модель из адреса `apple.com/hk/shop/buy-iphone/…`: `iphone-18-pro`, `iphone-air`, `iphone-duo`, `iphone-17`, `iphone-17e`, `iphone-16`.
+
+## Как не приходят дубли
+
+`stock_state.json` хранит, какие конфигурации в каких магазинах уже были в наличии на момент последней проверки. Workflow коммитит его, только когда что-то действительно изменилось.
+
+Сообщение приходит, когда конфигурация появляется в магазине, где её до этого не было. Если она пропала, а потом появилась снова, придёт новое сообщение. Если отправить сообщение не удалось, состояние не обновляется, и отправка повторится на следующей проверке.
+
+## Запуск на своём компьютере
+
+```bash
+python3 check_stock.py --dry-run
+```
+
+Проверяет наличие и показывает сообщение, которое было бы отправлено, — ничего не отправляя и не меняя `stock_state.json`.
+
+## Чем отличается от оригинала
+
+- Уведомления в Telegram вместо почты, плюс сообщения о сбоях проверки.
+- apple.com/hk вместо apple.com/uk и артикулы `…ZA/A`. Почтовых индексов в Гонконге нет: на запрос с районом `Central` Apple возвращает все 6 магазинов.
+- 12 конфигураций одним запросом вместо одной; название модели берётся из ответа Apple.
+- Несколько проверок за запуск. Расписание «каждые 5 минут» GitHub на практике запускает раз в 15–20 минут (это видно по истории коммитов оригинала), и одна проверка за запуск оставляла бы большие окна.
+- Исправлена проверка `storeSelectionEnabled`: в ответе Apple это поле лежит в `messageTypes.regular`, а оригинал искал его уровнем выше и фактически смотрел только на `pickupDisplay`.
+- Состояние коммитится только при изменениях, а не каждые 5 минут.
+- Неверный артикул (например, британский) — явная ошибка, а не тихое «нет в наличии».
+
+## Ограничения
+
+- API самовывоза Apple недокументирован и может измениться. Скрипт делает только публичные read-only запросы, как страница магазина, и не обходит CAPTCHA, авторизацию, ограничения частоты или защиту от ботов.
+- GitHub не гарантирует время запуска по расписанию: под нагрузкой запуски задерживаются или пропускаются.
+- В публичном репозитории GitHub отключает расписание после 60 дней без активности. Включить снова: **Actions → iPhone Stock Watch (Apple Store Hong Kong) → Enable workflow**.
+- Наличие меняется быстро. Перед поездкой проверьте магазин и время выдачи на сайте Apple.
