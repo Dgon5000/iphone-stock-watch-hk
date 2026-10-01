@@ -50,6 +50,10 @@ TELEGRAM_TOKEN_RE = re.compile(r"[0-9]+:[A-Za-z0-9_-]+")  # bot number, colon, s
 TELEGRAM_MAX_LENGTH = 4000  # Telegram allows 4096 characters per message.
 # Report a broken watcher to Telegram only once it has been failing this long.
 PROBLEM_ALERT_AFTER = timedelta(minutes=30)
+# While Apple releases stock its answers flicker ("in stock", nothing, "in stock"
+# seconds apart). A store/model counts as sold out only after it has been missing
+# this long, so the flicker does not repeat alerts but a real restock still does.
+FORGET_AFTER = timedelta(minutes=10)
 STATE_FILE = Path(__file__).resolve().with_name("stock_state.json")
 HKT = timezone(timedelta(hours=8))  # Hong Kong has no daylight saving time.
 USER_AGENT = (
@@ -140,22 +144,42 @@ def write_state(state):
     STATE_FILE.write_text(json.dumps(state, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
-def alerted_keys(state):
-    items = state.get("available")
-    if not isinstance(items, list):
-        return set()
-    return {
-        stock_key(i)
-        for i in items
-        if isinstance(i, dict) and i.get("storeNumber") and i.get("partNumber")
-    }
+def parse_utc(text):
+    try:
+        parsed = datetime.fromisoformat(text)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed.tzinfo else None
 
 
-def stock_snapshot(available):
+def remembered_stock(state, parts):
+    """Stock that was already alerted: in stock at the last check, or missing for
+    less than FORGET_AFTER. Keyed by stock_key."""
+    items = {}
+    for field in ("available", "recently_gone"):
+        for item in state.get(field) or []:
+            if isinstance(item, dict) and item.get("storeNumber") and item.get("partNumber") in parts:
+                items[stock_key(item)] = item
+    return items
+
+
+def stock_snapshot(items, extra=()):
     return sorted(
-        ({k: item[k] for k in ("storeNumber", "storeName", "partNumber", "product")} for item in available),
+        ({k: item.get(k, "") for k in ("storeNumber", "storeName", "partNumber", "product", *extra)} for item in items),
         key=lambda i: (i["partNumber"], i["storeNumber"]),
     )
+
+
+def recently_gone(remembered, current, now):
+    """Remembered stock missing from this check that has not been gone for FORGET_AFTER yet."""
+    gone = []
+    for key, item in remembered.items():
+        if key in current:
+            continue
+        since = parse_utc(item.get("gone_since_utc")) or now
+        if now - since < FORGET_AFTER:
+            gone.append({**item, "gone_since_utc": since.isoformat(timespec="seconds")})
+    return stock_snapshot(gone, extra=("gone_since_utc",))
 
 
 def request_stores(parts):
@@ -385,10 +409,7 @@ def report_health(state, problem):
     if known is None:
         known = {"since_utc": now.isoformat(timespec="seconds"), "notified": False}
         state["problem"] = known
-    try:
-        since = datetime.fromisoformat(known["since_utc"])
-    except Exception:
-        since = now
+    since = parse_utc(known.get("since_utc")) or now
     if not known.get("notified") and now - since >= PROBLEM_ALERT_AFTER:
         minutes = int((now - since).total_seconds() // 60)
         text = (
@@ -408,7 +429,7 @@ def report_health(state, problem):
 def run_checks(parts, checks, interval, dry_run):
     """Return the process exit code."""
     state = read_state()
-    alerted = alerted_keys(state)
+    remembered = remembered_stock(state, parts)
     successful_checks = 0
     failed = False
     last_error = ""
@@ -438,7 +459,7 @@ def run_checks(parts, checks, interval, dry_run):
             )
 
         current = {stock_key(item): item for item in result.available}
-        new_items = [current[k] for k in sorted(set(current) - alerted)]
+        new_items = [current[k] for k in sorted(set(current) - set(remembered))]
 
         if new_items:
             message = alert_message(new_items, parts)
@@ -459,8 +480,14 @@ def run_checks(parts, checks, interval, dry_run):
 
         if dry_run:
             continue
-        alerted = set(current)
-        state.update(part_numbers=parts, location=LOCATION, available=stock_snapshot(result.available))
+        gone = recently_gone(remembered, current, datetime.now(timezone.utc))
+        state.update(
+            part_numbers=parts,
+            location=LOCATION,
+            available=stock_snapshot(result.available),
+            recently_gone=gone or None,
+        )
+        remembered = remembered_stock(state, parts)
         write_state(state)
 
     if successful_checks == 0:
