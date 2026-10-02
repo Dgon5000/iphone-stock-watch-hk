@@ -16,155 +16,41 @@
   "location": "Central",
   "available": [
     {
-      "storeNumber": "R409",
-      "storeName": "Causeway Bay",
       "partNumber": "MJXU4ZA/A",
       "product": "iPhone 18 Pro Max 512GB Silver"
     },
     {
-      "storeNumber": "R610",
-      "storeName": "New Town Plaza",
-      "partNumber": "MJXU4ZA/A",
-      "product": "iPhone 18 Pro Max 512GB Silver"
-    },
-    {
-      "storeNumber": "R610",
-      "storeName": "New Town Plaza",
       "partNumber": "MJXW4ZA/A",
       "product": "iPhone 18 Pro Max 512GB Glacier"
     },
     {
-      "storeNumber": "R610",
-      "storeName": "New Town Plaza",
-      "partNumber": "MJXY4ZA/A",
-      "product": "iPhone 18 Pro Max 1TB Silver"
-    },
-    {
-      "storeNumber": "R409",
-      "storeName": "Causeway Bay",
       "partNumber": "MJY24ZA/A",
       "product": "iPhone 18 Pro Max 2TB Black"
     },
     {
-      "storeNumber": "R485",
-      "storeName": "Festival Walk",
-      "partNumber": "MJY24ZA/A",
-      "product": "iPhone 18 Pro Max 2TB Black"
-    },
-    {
-      "storeNumber": "R499",
-      "storeName": "Canton Road",
-      "partNumber": "MJY24ZA/A",
-      "product": "iPhone 18 Pro Max 2TB Black"
-    },
-    {
-      "storeNumber": "R610",
-      "storeName": "New Town Plaza",
-      "partNumber": "MJY24ZA/A",
-      "product": "iPhone 18 Pro Max 2TB Black"
-    },
-    {
-      "storeNumber": "R409",
-      "storeName": "Causeway Bay",
       "partNumber": "MJY34ZA/A",
       "product": "iPhone 18 Pro Max 2TB Silver"
     },
     {
-      "storeNumber": "R485",
-      "storeName": "Festival Walk",
-      "partNumber": "MJY34ZA/A",
-      "product": "iPhone 18 Pro Max 2TB Silver"
-    },
-    {
-      "storeNumber": "R499",
-      "storeName": "Canton Road",
-      "partNumber": "MJY34ZA/A",
-      "product": "iPhone 18 Pro Max 2TB Silver"
-    },
-    {
-      "storeNumber": "R610",
-      "storeName": "New Town Plaza",
-      "partNumber": "MJY34ZA/A",
-      "product": "iPhone 18 Pro Max 2TB Silver"
-    },
-    {
-      "storeNumber": "R409",
-      "storeName": "Causeway Bay",
       "partNumber": "MJY44ZA/A",
       "product": "iPhone 18 Pro Max 2TB Burgundy"
     },
     {
-      "storeNumber": "R485",
-      "storeName": "Festival Walk",
-      "partNumber": "MJY44ZA/A",
-      "product": "iPhone 18 Pro Max 2TB Burgundy"
-    },
-    {
-      "storeNumber": "R499",
-      "storeName": "Canton Road",
-      "partNumber": "MJY44ZA/A",
-      "product": "iPhone 18 Pro Max 2TB Burgundy"
-    },
-    {
-      "storeNumber": "R610",
-      "storeName": "New Town Plaza",
-      "partNumber": "MJY44ZA/A",
-      "product": "iPhone 18 Pro Max 2TB Burgundy"
-    },
-    {
-      "storeNumber": "R409",
-      "storeName": "Causeway Bay",
-      "partNumber": "MJY54ZA/A",
-      "product": "iPhone 18 Pro Max 2TB Glacier"
-    },
-    {
-      "storeNumber": "R485",
-      "storeName": "Festival Walk",
-      "partNumber": "MJY54ZA/A",
-      "product": "iPhone 18 Pro Max 2TB Glacier"
-    },
-    {
-      "storeNumber": "R499",
-      "storeName": "Canton Road",
-      "partNumber": "MJY54ZA/A",
-      "product": "iPhone 18 Pro Max 2TB Glacier"
-    },
-    {
-      "storeNumber": "R610",
-      "storeName": "New Town Plaza",
       "partNumber": "MJY54ZA/A",
       "product": "iPhone 18 Pro Max 2TB Glacier"
     }
   ],
   "recently_gone": [
     {
-      "storeNumber": "R485",
-      "storeName": "Festival Walk",
-      "partNumber": "MJXU4ZA/A",
-      "product": "iPhone 18 Pro Max 512GB Silver",
-      "gone_since_utc": "2026-10-02T00:14:22+00:00"
+      "partNumber": "MJXY4ZA/A",
+      "product": "iPhone 18 Pro Max 1TB Silver",
+      "gone_since_utc": "2026-10-02T00:19:24+00:00"
     },
     {
-      "storeNumber": "R409",
-      "storeName": "Causeway Bay",
-      "partNumber": "MJXW4ZA/A",
-      "product": "iPhone 18 Pro Max 512GB Glacier",
-      "gone_since_utc": "2026-10-02T00:14:22+00:00"
-    },
-    {
-      "storeNumber": "R485",
-      "storeName": "Festival Walk",
-      "partNumber": "MJXW4ZA/A",
-      "product": "iPhone 18 Pro Max 512GB Glacier",
-      "gone_since_utc": "2026-10-02T00:14:22+00:00"
-    },
-    {
-      "storeNumber": "R610",
-      "storeName": "New Town Plaza",
       "partNumber": "MJY14ZA/A",
       "product": "iPhone 18 Pro Max 1TB Glacier",
       "gone_since_utc": "2026-10-02T00:14:22+00:00"
     }
   ],
-  "updated_hkt": "2026-10-02 08:14:22 HKT"
+  "updated_hkt": "2026-10-02 08:19:24 HKT"
 }
