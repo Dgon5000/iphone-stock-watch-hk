@@ -14,38 +14,39 @@
     "MJY44ZA/A"
   ],
   "location": "Central",
-  "available": [],
-  "recently_gone": [
+  "available": [
     {
       "partNumber": "MJXU4ZA/A",
-      "product": "iPhone 18 Pro Max 512GB Silver",
-      "gone_since_utc": "2026-10-02T00:49:39+00:00"
+      "product": "iPhone 18 Pro Max 512GB Silver"
     },
     {
       "partNumber": "MJXW4ZA/A",
-      "product": "iPhone 18 Pro Max 512GB Glacier",
-      "gone_since_utc": "2026-10-02T00:49:39+00:00"
+      "product": "iPhone 18 Pro Max 512GB Glacier"
+    },
+    {
+      "partNumber": "MJXY4ZA/A",
+      "product": "iPhone 18 Pro Max 1TB Silver"
+    },
+    {
+      "partNumber": "MJY14ZA/A",
+      "product": "iPhone 18 Pro Max 1TB Glacier"
     },
     {
       "partNumber": "MJY24ZA/A",
-      "product": "iPhone 18 Pro Max 2TB Black",
-      "gone_since_utc": "2026-10-02T00:49:39+00:00"
+      "product": "iPhone 18 Pro Max 2TB Black"
     },
     {
       "partNumber": "MJY34ZA/A",
-      "product": "iPhone 18 Pro Max 2TB Silver",
-      "gone_since_utc": "2026-10-02T00:49:39+00:00"
+      "product": "iPhone 18 Pro Max 2TB Silver"
     },
     {
       "partNumber": "MJY44ZA/A",
-      "product": "iPhone 18 Pro Max 2TB Burgundy",
-      "gone_since_utc": "2026-10-02T00:49:39+00:00"
+      "product": "iPhone 18 Pro Max 2TB Burgundy"
     },
     {
       "partNumber": "MJY54ZA/A",
-      "product": "iPhone 18 Pro Max 2TB Glacier",
-      "gone_since_utc": "2026-10-02T00:49:39+00:00"
+      "product": "iPhone 18 Pro Max 2TB Glacier"
     }
   ],
-  "updated_hkt": "2026-10-02 08:54:41 HKT"
+  "updated_hkt": "2026-10-02 08:59:45 HKT"
 }
