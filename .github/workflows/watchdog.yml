@@ -1,0 +1,35 @@
+name: Stock Watch Watchdog
+
+# Starts iPhone Stock Watch again if it is not running, e.g. after a GitHub outage.
+on:
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+
+permissions:
+  actions: write
+
+jobs:
+  ensure-running:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Start iPhone Stock Watch if it is not running
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          state=$(gh workflow list --all --json path,state --jq '.[] | select(.path | endswith("/stock-watch.yml")) | .state')
+          if [ "$state" != "active" ]; then
+            echo "iPhone Stock Watch is ${state:-missing}; not starting it."
+            exit 0
+          fi
+
+          active=$(gh run list --workflow stock-watch.yml --limit 20 --json status --jq '[.[] | select(.status != "completed")] | length')
+          if [ "$active" -gt 0 ]; then
+            echo "iPhone Stock Watch is running."
+          else
+            echo "iPhone Stock Watch is not running; starting it."
+            gh workflow run stock-watch.yml
+          fi
