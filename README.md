@@ -1,7 +1,6 @@
 # iPhone Stock Watch — Apple Store Hong Kong
 
-Присылает уведомление в **Telegram**, когда iPhone 18 Pro Max появляется для **самовывоза (Pick up) в любом Apple Store Гонконга**. Основано на проекте [therijalclub-jpg/iphone-stock-watch](https://github.com/therijalclub-jpg/iphone-stock-watch) (Apple UK, уведомления на почту), переделано под apple.com/hk и Telegram.
-
+Присылает уведомление в **Telegram**, когда iPhone 18 Pro Max появляется для **самовывоза (Pick up) в любом Apple Store Гонконга**.
 ## Что отслеживается
 
 **iPhone 18 Pro Max 512GB, 1TB и 2TB во всех четырёх цветах** — 12 конфигураций. Артикулы гонконгские (`…ZA/A`), британские (`…QN/A`) в Гонконге не продаются. Цены — на 2 октября 2026.
