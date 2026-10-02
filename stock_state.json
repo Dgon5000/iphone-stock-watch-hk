@@ -16,14 +16,6 @@
   "location": "Central",
   "available": [
     {
-      "partNumber": "MJXU4ZA/A",
-      "product": "iPhone 18 Pro Max 512GB Silver"
-    },
-    {
-      "partNumber": "MJXW4ZA/A",
-      "product": "iPhone 18 Pro Max 512GB Glacier"
-    },
-    {
       "partNumber": "MJY24ZA/A",
       "product": "iPhone 18 Pro Max 2TB Black"
     },
@@ -42,9 +34,14 @@
   ],
   "recently_gone": [
     {
-      "partNumber": "MJXX4ZA/A",
-      "product": "iPhone 18 Pro Max 1TB Black",
-      "gone_since_utc": "2026-10-02T01:09:49+00:00"
+      "partNumber": "MJXU4ZA/A",
+      "product": "iPhone 18 Pro Max 512GB Silver",
+      "gone_since_utc": "2026-10-02T01:19:54+00:00"
+    },
+    {
+      "partNumber": "MJXW4ZA/A",
+      "product": "iPhone 18 Pro Max 512GB Glacier",
+      "gone_since_utc": "2026-10-02T01:19:54+00:00"
     },
     {
       "partNumber": "MJY14ZA/A",
@@ -52,5 +49,5 @@
       "gone_since_utc": "2026-10-02T01:14:51+00:00"
     }
   ],
-  "updated_hkt": "2026-10-02 09:14:51 HKT"
+  "updated_hkt": "2026-10-02 09:19:54 HKT"
 }
