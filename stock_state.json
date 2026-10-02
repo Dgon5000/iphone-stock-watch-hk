@@ -22,28 +22,10 @@
       "product": "iPhone 18 Pro Max 512GB Silver"
     },
     {
-      "storeNumber": "R485",
-      "storeName": "Festival Walk",
-      "partNumber": "MJXU4ZA/A",
-      "product": "iPhone 18 Pro Max 512GB Silver"
-    },
-    {
       "storeNumber": "R610",
       "storeName": "New Town Plaza",
       "partNumber": "MJXU4ZA/A",
       "product": "iPhone 18 Pro Max 512GB Silver"
-    },
-    {
-      "storeNumber": "R409",
-      "storeName": "Causeway Bay",
-      "partNumber": "MJXW4ZA/A",
-      "product": "iPhone 18 Pro Max 512GB Glacier"
-    },
-    {
-      "storeNumber": "R485",
-      "storeName": "Festival Walk",
-      "partNumber": "MJXW4ZA/A",
-      "product": "iPhone 18 Pro Max 512GB Glacier"
     },
     {
       "storeNumber": "R610",
@@ -56,12 +38,6 @@
       "storeName": "New Town Plaza",
       "partNumber": "MJXY4ZA/A",
       "product": "iPhone 18 Pro Max 1TB Silver"
-    },
-    {
-      "storeNumber": "R610",
-      "storeName": "New Town Plaza",
-      "partNumber": "MJY14ZA/A",
-      "product": "iPhone 18 Pro Max 1TB Glacier"
     },
     {
       "storeNumber": "R409",
@@ -160,5 +136,35 @@
       "product": "iPhone 18 Pro Max 2TB Glacier"
     }
   ],
-  "updated_hkt": "2026-10-02 08:09:20 HKT"
+  "recently_gone": [
+    {
+      "storeNumber": "R485",
+      "storeName": "Festival Walk",
+      "partNumber": "MJXU4ZA/A",
+      "product": "iPhone 18 Pro Max 512GB Silver",
+      "gone_since_utc": "2026-10-02T00:14:22+00:00"
+    },
+    {
+      "storeNumber": "R409",
+      "storeName": "Causeway Bay",
+      "partNumber": "MJXW4ZA/A",
+      "product": "iPhone 18 Pro Max 512GB Glacier",
+      "gone_since_utc": "2026-10-02T00:14:22+00:00"
+    },
+    {
+      "storeNumber": "R485",
+      "storeName": "Festival Walk",
+      "partNumber": "MJXW4ZA/A",
+      "product": "iPhone 18 Pro Max 512GB Glacier",
+      "gone_since_utc": "2026-10-02T00:14:22+00:00"
+    },
+    {
+      "storeNumber": "R610",
+      "storeName": "New Town Plaza",
+      "partNumber": "MJY14ZA/A",
+      "product": "iPhone 18 Pro Max 1TB Glacier",
+      "gone_since_utc": "2026-10-02T00:14:22+00:00"
+    }
+  ],
+  "updated_hkt": "2026-10-02 08:14:22 HKT"
 }
