@@ -24,10 +24,6 @@
       "product": "iPhone 18 Pro Max 512GB Glacier"
     },
     {
-      "partNumber": "MJXX4ZA/A",
-      "product": "iPhone 18 Pro Max 1TB Black"
-    },
-    {
       "partNumber": "MJY14ZA/A",
       "product": "iPhone 18 Pro Max 1TB Glacier"
     },
@@ -50,10 +46,15 @@
   ],
   "recently_gone": [
     {
+      "partNumber": "MJXX4ZA/A",
+      "product": "iPhone 18 Pro Max 1TB Black",
+      "gone_since_utc": "2026-10-02T01:09:49+00:00"
+    },
+    {
       "partNumber": "MJXY4ZA/A",
       "product": "iPhone 18 Pro Max 1TB Silver",
       "gone_since_utc": "2026-10-02T01:04:47+00:00"
     }
   ],
-  "updated_hkt": "2026-10-02 09:04:47 HKT"
+  "updated_hkt": "2026-10-02 09:09:49 HKT"
 }
