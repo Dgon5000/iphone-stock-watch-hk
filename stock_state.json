@@ -16,10 +16,6 @@
   "location": "Central",
   "available": [
     {
-      "partNumber": "MJXY4ZA/A",
-      "product": "iPhone 18 Pro Max 1TB Silver"
-    },
-    {
       "partNumber": "MJY24ZA/A",
       "product": "iPhone 18 Pro Max 2TB Black"
     },
@@ -36,5 +32,12 @@
       "product": "iPhone 18 Pro Max 2TB Glacier"
     }
   ],
-  "updated_hkt": "2026-10-02 11:45:34 HKT"
+  "recently_gone": [
+    {
+      "partNumber": "MJXY4ZA/A",
+      "product": "iPhone 18 Pro Max 1TB Silver",
+      "gone_since_utc": "2026-10-02T03:50:36+00:00"
+    }
+  ],
+  "updated_hkt": "2026-10-02 11:50:36 HKT"
 }
