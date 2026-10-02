@@ -2,7 +2,8 @@
 """Apple Store Hong Kong pickup stock watcher.
 
 Checks in-store pickup availability of the watched iPhone part numbers at every
-Apple Store in Hong Kong and sends one Telegram alert when a store newly has stock.
+Apple Store in Hong Kong and sends one Telegram alert when a configuration comes
+into stock at any of them.
 """
 import argparse
 import json
@@ -54,6 +55,13 @@ PROBLEM_ALERT_AFTER = timedelta(minutes=30)
 # seconds apart). A store/model counts as sold out only after it has been missing
 # this long, so the flicker does not repeat alerts but a real restock still does.
 FORGET_AFTER = timedelta(minutes=10)
+# Apple's product titles look like "iPhone 18 Pro Max 512GB Silver".
+TITLE_RE = re.compile(r"(?P<model>.+?)\s+(?P<storage>\d+\s?[GT]B)\s+(?P<color>.+)")
+COLOR_EMOJI = {
+    "silver": "🩶", "black": "🖤", "glacier": "🩵", "burgundy": "❤️",
+    "white": "🤍", "gold": "💛", "blue": "💙", "teal": "🩵", "pink": "🩷",
+    "green": "💚", "sage": "💚", "lavender": "💜", "purple": "💜", "orange": "🧡", "red": "❤️",
+}
 STATE_FILE = Path(__file__).resolve().with_name("stock_state.json")
 HKT = timezone(timedelta(hours=8))  # Hong Kong has no daylight saving time.
 USER_AGENT = (
@@ -112,16 +120,18 @@ def env_int(name, default, minimum):
     return value
 
 
-def stock_key(item):
-    return f'{item["storeNumber"]}|{item["partNumber"]}'
+def describe(title):
+    """Split "iPhone 18 Pro Max 512GB Silver" into model, storage and colour."""
+    match = TITLE_RE.fullmatch(title)
+    return (match["model"], match["storage"].replace(" ", ""), match["color"]) if match else (title, "", "")
 
 
-def store_label(item):
-    label = f'Apple {item["storeName"]}'
-    city = item.get("city") or ""
-    if city and city.lower() not in item["storeName"].lower():
-        label += f", {city}"
-    return label
+def color_emoji(color):
+    # The last known word wins: "Space Black" -> black, "Light Gold" -> gold.
+    for word in reversed(color.lower().split()):
+        if word in COLOR_EMOJI:
+            return COLOR_EMOJI[word]
+    return "🎨"
 
 
 def read_state():
@@ -153,28 +163,27 @@ def parse_utc(text):
 
 
 def remembered_stock(state, parts):
-    """Stock that was already alerted: in stock at the last check, or missing for
-    less than FORGET_AFTER. Keyed by stock_key."""
+    """Configurations already alerted: in stock at the last check, or missing for
+    less than FORGET_AFTER. Keyed by part number."""
     items = {}
-    for field in ("available", "recently_gone"):
+    for field in ("recently_gone", "available"):  # "available" wins if a part is in both
         for item in state.get(field) or []:
-            if isinstance(item, dict) and item.get("storeNumber") and item.get("partNumber") in parts:
-                items[stock_key(item)] = item
+            if isinstance(item, dict) and item.get("partNumber") in parts:
+                items[item["partNumber"]] = item
     return items
 
 
 def stock_snapshot(items, extra=()):
-    return sorted(
-        ({k: item.get(k, "") for k in ("storeNumber", "storeName", "partNumber", "product", *extra)} for item in items),
-        key=lambda i: (i["partNumber"], i["storeNumber"]),
-    )
+    """One entry per part number, however many stores have it."""
+    snapshot = {item["partNumber"]: {k: item.get(k, "") for k in ("partNumber", "product", *extra)} for item in items}
+    return [snapshot[part] for part in sorted(snapshot)]
 
 
 def recently_gone(remembered, current, now):
-    """Remembered stock missing from this check that has not been gone for FORGET_AFTER yet."""
+    """Remembered configurations missing from this check that have not been gone for FORGET_AFTER yet."""
     gone = []
-    for key, item in remembered.items():
-        if key in current:
+    for part, item in remembered.items():
+        if part in current:
             continue
         since = parse_utc(item.get("gone_since_utc")) or now
         if now - since < FORGET_AFTER:
@@ -350,24 +359,26 @@ def send_telegram(text):
             )
 
 
+def config_blocks(items, status):
+    """A bold model header per model, then one line per configuration:
+    colour emoji, storage, colour and status(item) (a link or a word)."""
+    groups = {}
+    for item in items:
+        model, storage, color = describe(item["product"])
+        details = " · ".join(escape(x) for x in (storage, color) if x)
+        line = f"{color_emoji(color)} {details} — {status(item)}" if details else status(item)
+        groups.setdefault(model, []).append(line)
+    return [f"<b>📱 {escape(model)}</b>\n" + "\n".join(lines) for model, lines in groups.items()]
+
+
+def checkout_link(item):
+    return f'<a href="{escape(PRODUCT_URL.format(part=item["partNumber"]))}">🛒 Оформить</a>'
+
+
 def alert_message(new_items, parts):
     order = {part: i for i, part in enumerate(parts)}
-    by_part = {}
-    for item in sorted(new_items, key=lambda i: (order.get(i["partNumber"], len(order)), i["storeName"].lower())):
-        by_part.setdefault(item["partNumber"], []).append(item)
-    products = [items[0]["product"] for items in by_part.values()]
-
-    headline = f"🟢 В наличии: {products[0]}"
-    if len(products) > 1:
-        headline += f" и ещё {len(products) - 1}"
-    blocks = [escape(headline)]
-    for part, items in by_part.items():
-        lines = [f'<b>{escape(items[0]["product"])}</b>']
-        lines += [f'• {escape(store_label(item))} — {escape(item["pickup"])}' for item in items]
-        lines.append(f'<a href="{escape(PRODUCT_URL.format(part=part))}">Оформить самовывоз</a>')
-        blocks.append("\n".join(lines))
-    blocks.append(f"Apple Store Hong Kong · проверено {now_hkt()}")
-    return "\n\n".join(blocks)
+    items = sorted(new_items, key=lambda i: order.get(i["partNumber"], len(order)))
+    return "\n\n".join(["🍏 В наличии в Apple Store Hong Kong", *config_blocks(items, checkout_link)])
 
 
 def stores_with_stock(result, part):
@@ -458,12 +469,14 @@ def run_checks(parts, checks, interval, dry_run):
                 error=True,
             )
 
-        current = {stock_key(item): item for item in result.available}
-        new_items = [current[k] for k in sorted(set(current) - set(remembered))]
+        current = {}
+        for item in result.available:
+            current.setdefault(item["partNumber"], item)
+        new_items = [current[part] for part in parts if part in current and part not in remembered]
 
         if new_items:
             message = alert_message(new_items, parts)
-            log(f"NEW STOCK FOUND: {len(new_items)} store/model combination(s).")
+            log(f"NEW STOCK FOUND: {len(new_items)} configuration(s).")
             if dry_run:
                 print(f"--- dry run, Telegram message not sent ---\n{message}\n---", flush=True)
                 continue
@@ -476,7 +489,7 @@ def run_checks(parts, checks, interval, dry_run):
                 continue
             log("Telegram alert sent.")
         elif current:
-            log(f"Still available at {len(current)} previously alerted store/model combination(s); no duplicate alert.")
+            log(f"Still in stock: {len(current)} previously alerted configuration(s); no duplicate alert.")
 
         if dry_run:
             continue
@@ -507,27 +520,18 @@ def send_test_message(parts):
     try:
         result = fetch_stock(parts)
     except Exception as exc:
-        status = [f"Не удалось проверить наличие: {escape(str(exc))}"]
+        status = [f"⚠️ Не удалось проверить наличие: {escape(str(exc))}"]
     else:
-        status = [f"Магазинов: {result.store_count}, конфигураций: {len(parts)}. Сейчас:"]
-        for part in parts:
-            stores = stores_with_stock(result, part)
-            if part in result.missing_parts:
-                state = "Apple не вернул данные — проверьте артикул"
-            else:
-                state = ("есть в " + ", ".join(stores)) if stores else "нет в наличии"
-            status.append(f"• {escape(result.products.get(part, part))} — {escape(state)}")
-    send_telegram(
-        "\n".join(
-            [
-                "✅ Тест: уведомления о наличии iPhone в Apple Store Hong Kong будут приходить сюда.",
-                "",
-                *status,
-                "",
-                f"Проверено: {now_hkt()}",
-            ]
-        )
-    )
+        in_stock = {item["partNumber"] for item in result.available}
+
+        def availability(item):
+            if item["partNumber"] in result.missing_parts:
+                return "⚠️ нет данных, проверьте артикул"
+            return "✅ в наличии" if item["partNumber"] in in_stock else "➖ нет"
+
+        items = [{"partNumber": part, "product": result.products.get(part, part)} for part in parts]
+        status = ["Сейчас:", *config_blocks(items, availability)]
+    send_telegram("\n\n".join(["🧪 Тест: уведомления о наличии в Apple Store Hong Kong будут приходить сюда.", *status]))
     log("Test Telegram message sent.")
 
 
