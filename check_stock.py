@@ -360,25 +360,32 @@ def send_telegram(text):
 
 
 def config_blocks(items, status):
-    """A bold model header per model, then one line per configuration:
-    colour emoji, storage, colour and status(item) (a link or a word)."""
+    """A bold model header per model, then one line per configuration (colour
+    emoji, storage, colour and status(item)) with a blank line between storage sizes."""
     groups = {}
     for item in items:
         model, storage, color = describe(item["product"])
         details = " · ".join(escape(x) for x in (storage, color) if x)
         line = f"{color_emoji(color)} {details} — {status(item)}" if details else status(item)
-        groups.setdefault(model, []).append(line)
-    return [f"<b>📱 {escape(model)}</b>\n" + "\n".join(lines) for model, lines in groups.items()]
+        groups.setdefault(model, {}).setdefault(storage, []).append(line)
+    return [
+        f"<b>📱 {escape(model)}</b>\n" + "\n\n".join("\n".join(lines) for lines in by_storage.values())
+        for model, by_storage in groups.items()
+    ]
 
 
 def checkout_link(item):
     return f'<a href="{escape(PRODUCT_URL.format(part=item["partNumber"]))}">🛒 Оформить</a>'
 
 
+def checked_at():
+    return f"🕐 Проверено: {datetime.now(HKT):%d.%m.%Y %H:%M} (HKT)"
+
+
 def alert_message(new_items, parts):
     order = {part: i for i, part in enumerate(parts)}
     items = sorted(new_items, key=lambda i: order.get(i["partNumber"], len(order)))
-    return "\n\n".join(["🍏 В наличии в Apple Store Hong Kong", *config_blocks(items, checkout_link)])
+    return "\n\n".join(["🍏 В наличии в Apple Store Hong Kong", *config_blocks(items, checkout_link), checked_at()])
 
 
 def stores_with_stock(result, part):
@@ -531,7 +538,9 @@ def send_test_message(parts):
 
         items = [{"partNumber": part, "product": result.products.get(part, part)} for part in parts]
         status = ["Сейчас:", *config_blocks(items, availability)]
-    send_telegram("\n\n".join(["🧪 Тест: уведомления о наличии в Apple Store Hong Kong будут приходить сюда.", *status]))
+    send_telegram(
+        "\n\n".join(["🧪 Тест: уведомления о наличии в Apple Store Hong Kong будут приходить сюда.", *status, checked_at()])
+    )
     log("Test Telegram message sent.")
 
 
