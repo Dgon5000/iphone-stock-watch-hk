@@ -69,5 +69,5 @@ jobs:
             gh workflow run stock-watch.yml --ref "$GITHUB_REF_NAME" && exit 0
             sleep 20
           done
-          echo "::error::Could not start the next run; the watchdog will restart it within an hour."
+          echo "::error::Could not start the next run; the watchdog will restart it within half an hour."
           exit 1

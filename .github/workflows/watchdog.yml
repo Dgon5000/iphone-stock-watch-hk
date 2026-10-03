@@ -1,9 +1,10 @@
 name: Stock Watch Watchdog
 
 # Starts iPhone Stock Watch again if it is not running, e.g. after a GitHub outage.
+# Twice an hour, since GitHub skips scheduled runs when it is busy.
 on:
   schedule:
-    - cron: "17 * * * *"
+    - cron: "17,47 * * * *"
   workflow_dispatch:
 
 permissions:
