@@ -358,6 +358,13 @@ class Probe(FakeClockBase):
         self.assertTrue(self.delivered[0][1]["error"].startswith("Apple returned HTTP 403"))
         self.assertIn("stores", self.delivered[1][1])
 
+    def test_apples_541_is_a_refusal_too(self):
+        # 541: what Apple answered the server when it asked once a minute for an hour
+        self.world.apple_errors = [HTTPError("u", 541, "", {}, io.BytesIO(b""))] * 2
+        self.probe(minutes=8)
+        self.assertEqual(self.world.request_times, [hkt(t) for t in ("10:00:30", "10:02:30", "10:06:30", "10:07:30")])
+        self.assertIn("Apple refused the request (HTTP 541); no checks from here for 4 min.", self.stderr())
+
     def test_delivery_problems_are_explained(self):
         def run(outcome):
             with mock.patch.object(self.cs.subprocess, "run", side_effect=outcome if isinstance(outcome, BaseException) else None,

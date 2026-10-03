@@ -71,9 +71,10 @@ DEFAULT_SCHEDULE = "1,2,3"
 DEFAULT_STATUS_MINUTES = 10
 # A request that fails on the network (timeout, reset) is tried once more after this pause.
 NETWORK_RETRY_SECONDS = 5
-# When Apple refuses requests (HTTP 403 or 429), the computer pauses its checks for 2, 4, 8
-# and then at most 15 minutes instead of insisting.
-REFUSED_CODES = (403, 429)
+# When Apple refuses requests (HTTP 403, 429, or 541 — Apple's own "too many requests from
+# this address"), the computer pauses its checks for 2, 4, 8 and then at most 15 minutes
+# instead of insisting.
+REFUSED_CODES = (403, 429, 541)
 MAX_REFUSED_PAUSE_SECONDS = 15 * 60
 # Checks handed in by another computer (--probe → --ingest → --watch --inbox): at most this
 # big, at most this many waiting, and read by the watcher within INBOX_STALE_SECONDS. The
@@ -831,7 +832,7 @@ def next_slot(now, every, offset=0):
 
 
 class Backoff:
-    """When Apple refuses (HTTP 403 or 429), check less: none for 2, 4, 8, then 15 minutes."""
+    """When Apple refuses (HTTP 403, 429 or 541), check less: none for 2, 4, 8, then 15 minutes."""
 
     def __init__(self):
         self.refusals, self.until = 0, 0.0
