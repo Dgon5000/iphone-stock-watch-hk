@@ -2,8 +2,12 @@ name: iPhone Stock Watch (Apple Store Hong Kong)
 
 # GitHub's half of the checks: Apple at :30 of every minute, between the server's own
 # checks at :00, each answer handed to the server over SSH. Only the server sends to
-# Telegram and keeps the history, so nothing arrives twice. Near GitHub's 6-hour job
-# limit the job starts the next run; the watchdog workflow restarts the chain if it breaks.
+# Telegram and keeps the history, so nothing arrives twice.
+#
+# Runs follow each other: 10 minutes into a run the next one is lined up. It waits (one
+# at a time, see concurrency) and takes over as soon as this run ends, after its 5.5 hours
+# or earlier if GitHub loses it. GitHub often skips the watchdog's schedule, so the chain
+# must not depend on it.
 on:
   workflow_dispatch:
 
@@ -23,6 +27,9 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
+        with:
+          # The branch's latest code, not the commit of when this run was lined up.
+          ref: ${{ github.ref_name }}
 
       - name: Set up SSH to the server
         env:
@@ -59,15 +66,30 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           PART_NUMBERS: ${{ vars.PART_NUMBERS }}
-        run: python3 -u check_stock.py --probe feed --every 60 --offset 30 --minutes 330
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          # Line up the next run once this one has worked for 10 minutes. A run that fails
+          # sooner lines up nothing (GitHub ends the job and its leftovers), so a broken setup
+          # cannot loop. Detached from this step's output, which GitHub would wait for.
+          ( sleep 600 && gh workflow run stock-watch.yml --ref "$GITHUB_REF_NAME" && echo "The next run is lined up." ) \
+            > "$RUNNER_TEMP/line-up.log" 2>&1 < /dev/null &
+          python3 -u check_stock.py --probe feed --every 60 --offset 30 --minutes 330
 
-      - name: Start the next run
+      - name: Start the next run unless it is lined up
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          cat "$RUNNER_TEMP/line-up.log" 2>/dev/null || true
+          waiting=$(gh run list --workflow stock-watch.yml --limit 10 --json status \
+            --jq '[.[] | select(.status == "pending" or .status == "queued" or .status == "waiting" or .status == "requested")] | length')
+          if [ "$waiting" -gt 0 ]; then
+            echo "The next run is lined up already."
+            exit 0
+          fi
           for attempt in 1 2 3; do
             gh workflow run stock-watch.yml --ref "$GITHUB_REF_NAME" && exit 0
             sleep 20
           done
-          echo "::error::Could not start the next run; the watchdog will restart it within half an hour."
+          echo "::error::Could not start the next run; the server reports GitHub's silence after 30 minutes."
           exit 1
