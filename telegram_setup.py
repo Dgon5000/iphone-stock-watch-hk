@@ -6,10 +6,11 @@
 3. Run: python3 telegram_setup.py
 """
 import getpass
+import os
 import re
 import sys
 
-from check_stock import TELEGRAM_TOKEN_RE, telegram_api
+from check_stock import CONFIG_FILE, TELEGRAM_TOKEN_RE, telegram_api
 
 
 def normalize_token(raw):
@@ -42,6 +43,23 @@ def explain(exc, secret):
     if "HTTP 404" in text:
         return "Telegram не узнал токен (404 Not Found): в нём лишние или недостающие символы. Скопируйте его заново."
     return f"Ошибка: {text}"
+
+
+def save_config(token, chat_id):
+    """Keep the Telegram settings for runs on this computer, readable only by the user."""
+    CONFIG_FILE.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    keep = []
+    if CONFIG_FILE.exists():
+        keep = [
+            line
+            for line in CONFIG_FILE.read_text(encoding="utf-8").splitlines()
+            if not line.startswith(("TELEGRAM_BOT_TOKEN=", "TELEGRAM_CHAT_ID="))
+        ]
+    text = "\n".join(keep + [f"TELEGRAM_BOT_TOKEN={token}", f"TELEGRAM_CHAT_ID={chat_id}"]) + "\n"
+    fd = os.open(CONFIG_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(text)
+    os.chmod(CONFIG_FILE, 0o600)
 
 
 def chat_name(chat):
@@ -101,9 +119,15 @@ def main():
     except RuntimeError as exc:
         sys.exit(explain(exc, secret))
 
-    print("\nДобавьте в GitHub (Settings → Secrets and variables → Actions → New repository secret):")
+    print("\nДля GitHub (Settings → Secrets and variables → Actions → New repository secret):")
     print("  TELEGRAM_BOT_TOKEN = токен, который вы ввели")
     print(f"  TELEGRAM_CHAT_ID   = {chat_hint}")
+
+    if len(chats) == 1:
+        answer = input(f"\nСохранить токен и chat ID для запуска на этом компьютере ({CONFIG_FILE})? [Д/н] ")
+        if answer.strip().lower() in ("", "д", "да", "y", "yes"):
+            save_config(token, chat_hint)
+            print(f"Сохранено в {CONFIG_FILE}, доступ только у вашей учётной записи.")
 
 
 if __name__ == "__main__":
