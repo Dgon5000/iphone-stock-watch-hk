@@ -92,11 +92,12 @@ BOT_COMMANDS = [
 ]
 BOT_HELP = (
     "/iphone — что сейчас есть в наличии в Apple Store Hong Kong.\n"
-    "/report — когда что появлялось и сколько держалось, с таблицей для Excel.\n\n"
+    "/report — статистика: по памяти — в какие часы она появляется, или всё сразу.\n\n"
     "Об изменениях наличия я пишу сам."
 )
 STALE_COMMAND_SECONDS = 120
 STATUS_CACHE_SECONDS = 20
+REPORT_ALL = "report:all"  # the data of /report's "Все" button
 # Apple's product titles look like "iPhone 18 Pro Max 512GB Silver".
 TITLE_RE = re.compile(r"(?P<model>.+?)\s+(?P<storage>\d+\s?[GT]B)\s+(?P<color>.+)")
 COLOR_EMOJI = {
@@ -457,23 +458,23 @@ def telegram_settings():
     return token, chat_ids
 
 
-def send_telegram(text, silent=False, chat_ids=None):
+def send_telegram(text, silent=False, chat_ids=None, buttons=None):
     """Send an HTML message to every chat in TELEGRAM_CHAT_ID (or to chat_ids); silent ones
-    arrive without a sound."""
+    arrive without a sound. `buttons` (rows of inline buttons) go under its last part."""
     token, configured = telegram_settings()
     for chat_id in chat_ids or configured:
-        for chunk in split_message(text):
-            telegram_api(
-                token,
-                "sendMessage",
-                {
-                    "chat_id": chat_id,
-                    "text": chunk,
-                    "parse_mode": "HTML",
-                    "link_preview_options": {"is_disabled": True},
-                    "disable_notification": silent,
-                },
-            )
+        chunks = split_message(text)
+        for i, chunk in enumerate(chunks):
+            payload = {
+                "chat_id": chat_id,
+                "text": chunk,
+                "parse_mode": "HTML",
+                "link_preview_options": {"is_disabled": True},
+                "disable_notification": silent,
+            }
+            if buttons and i == len(chunks) - 1:
+                payload["reply_markup"] = {"inline_keyboard": buttons}
+            telegram_api(token, "sendMessage", payload)
 
 
 def tell(text):
@@ -1179,7 +1180,7 @@ def answer_command(token, allowed, message, parts, cache):
 
     try:
         if command == "/report":
-            send_report(token, chat_id)
+            send_report(token, chat_id)  # the buttons to choose
             return cache
         if command != "/iphone":
             send_telegram(BOT_HELP, chat_ids=[chat_id])
@@ -1201,8 +1202,29 @@ def answer_command(token, allowed, message, parts, cache):
     return cache
 
 
-def send_report(token, chat_id):
-    """The history report (stock_report.py) as a message, plus the CSV of every appearance."""
+def report_key(group):
+    """The data of a /report button for (model, storage); Telegram allows 64 bytes."""
+    return f"report:{group[0]} {group[1]}".encode("utf-8")[:64].decode("utf-8", "ignore")
+
+
+def report_buttons(groups):
+    """/report's buttons: one per model and storage (just the storage when one model is
+    watched), a row per model, then "Все" for the whole report."""
+    models = list(dict.fromkeys(model for model, _ in groups))
+    rows = [
+        [
+            {"text": storage if len(models) == 1 else f"{model.removeprefix('iPhone ')} {storage}",
+             "callback_data": report_key((model, storage))}
+            for m, storage in groups if m == model
+        ]
+        for model in models
+    ]
+    return rows + [[{"text": "Все", "callback_data": REPORT_ALL}]]
+
+
+def send_report(token, chat_id, choice=None):
+    """/report from the history (stock_report.py): without a choice the buttons to pick a model
+    and storage or "Все"; with one (a button's data) that report, the buttons under it again."""
     import stock_report  # imports this module, so only when needed
 
     try:
@@ -1212,15 +1234,45 @@ def send_report(token, chat_id):
     if not checks:
         send_telegram("Журнал наличия пока пуст: он заполняется с каждой проверкой.", chat_ids=[chat_id])
         return
-    telegram_api(token, "sendChatAction", {"chat_id": chat_id, "action": "upload_document"})
-    send_telegram(escape(stock_report.report(watched, checks, show_last=3, one_per_line=True)), chat_ids=[chat_id])
-    telegram_api(
-        token,
-        "sendDocument",
-        {"chat_id": chat_id, "caption": "Все появления — таблица для Excel/Numbers"},
-        document=("stock_intervals.csv", stock_report.csv_text(watched, checks).encode("utf-8-sig")),
-    )
-    log(f"Sent the report to chat {chat_id}.")
+    groups = stock_report.groups(watched)
+    buttons = report_buttons(groups)
+    if choice is None:
+        what = "память" if len({model for model, _ in groups}) == 1 else "модель и память"
+        send_telegram(
+            f"📊 Статистика наличия\n\nВыберите {what} — покажу, в какие часы появляется и в каких цветах. "
+            "«Все» — общий отчёт.",
+            chat_ids=[chat_id],
+            buttons=buttons,
+        )
+        return
+    telegram_api(token, "sendChatAction", {"chat_id": chat_id, "action": "typing"})
+    group = next((g for g in groups if report_key(g) == choice), None)
+    if group:
+        text = stock_report.group_report(watched, checks, group, show_last=3)
+    else:  # "Все", or a button from before the watch list changed
+        text = stock_report.report(watched, checks, show_last=3, one_per_line=True)
+    send_telegram(escape(text), chat_ids=[chat_id], buttons=buttons)
+    log(f"Sent the report ({choice}) to chat {chat_id}.")
+
+
+def answer_button(token, allowed, query):
+    """A tap on a /report button: that report, in the chat with the button."""
+    try:
+        # Stops the button's spinner; fails harmlessly for taps older than Telegram keeps.
+        telegram_api(token, "answerCallbackQuery", {"callback_query_id": query.get("id", "")})
+    except Exception as exc:
+        log(f"ERROR: could not answer a button: {exc}", error=True)
+    data = query.get("data") or ""
+    chat_id = str(((query.get("message") or {}).get("chat") or {}).get("id", ""))
+    if not data.startswith("report:"):
+        return
+    if chat_id not in allowed:
+        log(f"Ignored a report button from chat {chat_id}: it is not in TELEGRAM_CHAT_ID.")
+        return
+    try:
+        send_report(token, chat_id, data)
+    except Exception as exc:
+        log(f"ERROR: could not send the report: {exc}", error=True)
 
 
 def run_bot(parts):
@@ -1235,7 +1287,7 @@ def run_bot(parts):
     log("Bot is listening for /iphone and /report.")
     offset, cache = None, None
     while True:
-        poll = {"timeout": 50, "allowed_updates": ["message"]}
+        poll = {"timeout": 50, "allowed_updates": ["message", "callback_query"]}
         if offset is not None:
             poll["offset"] = offset
         try:
@@ -1246,7 +1298,10 @@ def run_bot(parts):
             continue
         for update in updates:
             offset = update["update_id"] + 1
-            cache = answer_command(token, allowed, update.get("message") or {}, parts, cache)
+            if "callback_query" in update:
+                answer_button(token, allowed, update["callback_query"])
+            else:
+                cache = answer_command(token, allowed, update.get("message") or {}, parts, cache)
 
 
 def send_test_message(parts):

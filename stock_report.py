@@ -111,27 +111,52 @@ def label(title):
     return f"{storage} · {color}" if storage else title
 
 
-def report(watched, checks, show_last=SHOW_LAST, one_per_line=False):
-    """The report text. one_per_line puts each appearance on its own line (for a phone)."""
+def groups(watched):
+    """(model, storage) of the watched configurations, in watch order: the bot's report buttons."""
+    return list(dict.fromkeys(describe(title)[:2] for title in watched if describe(title)[1]))
+
+
+def hours(found, first, colors=False):
+    """The "at which hours" histogram (HKT) as lines; with colors, also which colours came into
+    stock in each hour ("🩶2 🖤1"). `found` is {title: intervals} in watch order."""
+    starts = [(appeared, title) for title, runs in found.items() for appeared, _, _ in runs if appeared != first]
+    if not starts:
+        return []
+    by_hour = Counter(moment.astimezone(HKT).hour for moment, _ in starts)
+    top = max(by_hour.values())
+    lines = ["🕐 В какие часы появляется (HKT, число появлений):"]
+    for hour in sorted(by_hour):
+        bar = "█" * max(1, round(10 * by_hour[hour] / top))
+        line = f"{hour:02d}:00–{hour + 1:02d}:00  {bar} {by_hour[hour]}"
+        if colors:
+            per = Counter(title for moment, title in starts if moment.astimezone(HKT).hour == hour)
+            line += "  " + " ".join(f"{color_emoji(describe(title)[2])}{per[title]}" for title in found if per[title])
+        lines.append(line)
+    return lines + [""]
+
+
+def report(watched, checks, show_last=SHOW_LAST, one_per_line=False,
+           title="📊 История наличия в Apple Store Hong Kong", hours_first=False):
+    """The report text for the configurations in `watched`. one_per_line puts each appearance
+    on its own line (for a phone). hours_first (one model and storage, see group_report) puts
+    the hours, with the colours of each hour, before the appearances."""
     first, last = checks[0][0], checks[-1][0]
     found = {title: intervals(checks, title) for title in watched}
-    lines = [
-        "📊 История наличия в Apple Store Hong Kong",
-        f"Период: {when(first)} – {when(last)} (HKT), проверок: {len(checks)}",
-        "",
-        "Появления (появилось → закончилось, сколько держалось):",
-    ]
+    lines = [title, f"Период: {when(first)} – {when(last)} (HKT), проверок: {len(checks)}", ""]
+    if hours_first:
+        lines += hours(found, first, colors=True)
 
-    groups = {}
-    for title in watched:
-        model, storage, _ = describe(title)
-        groups.setdefault(model, {}).setdefault(storage, []).append(title)
-    for model, by_storage in groups.items():
+    by_model = {}
+    for name in watched:
+        model, storage, _ = describe(name)
+        by_model.setdefault(model, {}).setdefault(storage, []).append(name)
+    appearances = []
+    for model, by_storage in by_model.items():
         blocks = []
         for titles in by_storage.values():
             block = []
-            for title in titles:
-                runs = found[title]
+            for name in titles:
+                runs = found[name]
                 if not runs:
                     continue
                 parts = []
@@ -142,7 +167,7 @@ def report(watched, checks, show_last=SHOW_LAST, one_per_line=False):
                         same_day = sold_out.astimezone(HKT).date() == appeared.astimezone(HKT).date()
                         end = f"{when(sold_out)[6:] if same_day else when(sold_out)} ({lasted(sold_out - appeared)})"
                     parts.append(f"{start} → {end}")
-                head = f"{color_emoji(describe(title)[2])} {label(title)} — {times(len(runs))}"
+                head = f"{color_emoji(describe(name)[2])} {label(name)} — {times(len(runs))}"
                 if one_per_line:
                     shown = "последние:" if len(runs) > show_last else ""
                     block.append(f"{head}{', ' + shown if shown else ':'}\n" + "\n".join(f"   {part}" for part in parts))
@@ -152,26 +177,29 @@ def report(watched, checks, show_last=SHOW_LAST, one_per_line=False):
             if block:
                 blocks.append("\n".join(block))
         if blocks:
-            lines += [f"📱 {model}", "\n\n".join(blocks), ""]
+            appearances += ([] if hours_first else [f"📱 {model}"]) + ["\n\n".join(blocks), ""]
+    if appearances or not hours_first:
+        lines += ["Появления (появилось → закончилось, сколько держалось):", *appearances]
 
-    never = [label(title) for title in watched if not found[title]]
+    never = [label(name) for name in watched if not found[name]]
     if never:
         lines += [f"➖ Ни разу не появлялись: {', '.join(never)}", ""]
 
-    starts = [appeared for runs in found.values() for appeared, _, _ in runs if appeared != first]
-    if starts:
-        lines.append("🕐 В какие часы появляется (HKT, число появлений):")
-        by_hour = Counter(moment.astimezone(HKT).hour for moment in starts)
-        top = max(by_hour.values())
-        for hour in sorted(by_hour):
-            bar = "█" * max(1, round(10 * by_hour[hour] / top))
-            lines.append(f"{hour:02d}:00–{hour + 1:02d}:00  {bar} {by_hour[hour]}")
-        lines.append("")
+    if not hours_first:
+        lines += hours(found, first)
 
     stores = Counter(store for runs in found.values() for _, _, names in runs for store in names)
     if stores:
         lines.append("🏬 Где появлялось (число появлений): " + ", ".join(f"{name} {count}" for name, count in stores.most_common()))
     return "\n".join(lines).rstrip()
+
+
+def group_report(watched, checks, group, show_last=SHOW_LAST):
+    """One model and storage, e.g. ("iPhone 18 Pro Max", "512GB"), for a phone: at which hours
+    it comes into stock and in which colours, then each colour's appearances."""
+    model, storage = group
+    titles = [title for title in watched if describe(title)[:2] == (model, storage)]
+    return report(titles, checks, show_last, one_per_line=True, title=f"📊 {model} {storage}", hours_first=True)
 
 
 def csv_text(watched, checks):

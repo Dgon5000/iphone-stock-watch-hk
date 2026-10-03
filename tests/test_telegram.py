@@ -1049,24 +1049,94 @@ class TelegramBot(Base):
             {"time": "2026-10-03T07:16:00+08:00", "stores": 6, "in_stock": {}},
         ]))
 
-    def test_report_is_sent_with_a_csv_to_the_asking_chat(self):
+    BUTTONS = [
+        [{"text": "512GB", "callback_data": "report:iPhone 18 Pro Max 512GB"},
+         {"text": "1TB", "callback_data": "report:iPhone 18 Pro Max 1TB"}],
+        [{"text": "Все", "callback_data": "report:all"}],
+    ]
+
+    def tap(self, update_id, data, chat=987654321):
+        return {"update_id": update_id, "callback_query": {
+            "id": f"q{update_id}", "from": {"id": chat}, "data": data,
+            "message": {"message_id": 7, "chat": {"id": chat}, "date": int(self.cs.time.time()) - 3600}}}
+
+    def test_report_offers_buttons_by_storage_and_all(self):
         self.write_history()
         self.run_bot([self.message(1, "/report")])
-        self.assertEqual(self.calls("sendChatAction"), [{"chat_id": "987654321", "action": "upload_document"}])
+        [menu] = self.world.sent()
+        self.assertEqual(menu["chat_id"], "987654321")
+        self.assertEqual(menu["text"], "📊 Статистика наличия\n\nВыберите память — покажу, в какие часы появляется и в каких "
+                                       "цветах. «Все» — общий отчёт.")
+        self.assertEqual(menu["reply_markup"], {"inline_keyboard": self.BUTTONS})
+        self.assertEqual(self.calls("sendDocument"), [])
+        self.assertEqual(self.calls("getUpdates")[0]["allowed_updates"], ["message", "callback_query"])
+
+    def test_all_button_sends_the_whole_report_without_a_table(self):
+        self.write_history()
+        self.run_bot([self.tap(1, "report:all")])
+        self.assertEqual(self.calls("answerCallbackQuery"), [{"callback_query_id": "q1"}])
+        self.assertEqual(self.calls("sendChatAction"), [{"chat_id": "987654321", "action": "typing"}])
         [text] = self.world.sent()
         self.assertEqual(text["chat_id"], "987654321")
         body_text = check_html(text["text"])
         self.assertTrue(body_text.startswith("📊 История наличия в Apple Store Hong Kong\nПериод: 03.10 07:00 – 03.10 07:16 (HKT), проверок: 3"))
         self.assertIn("🩶 512GB · Silver — 1 раз:\n   03.10 07:12 → 07:16 (4 мин)", body_text)
         self.assertIn("➖ Ни разу не появлялись: 1TB · Burgundy", body_text)
-        [doc] = self.calls("sendDocument")
-        self.assertEqual(doc["chat_id"], "987654321")
-        self.assertEqual(doc["caption"], "Все появления — таблица для Excel/Numbers")
-        self.assertEqual(doc["document"]["filename"], "stock_intervals.csv")
-        csv_lines = doc["document"]["content"].decode("utf-8-sig").splitlines()
-        self.assertTrue(doc["document"]["content"].startswith(b"\xef\xbb\xbf"))
-        self.assertEqual(csv_lines[1], "iPhone 18 Pro Max;512GB;Silver;2026-10-03 07:12;2026-10-03 07:16;4;Canton Road;")
-        self.assertIn("Sent the report to chat 987654321", sys.stdout.getvalue())
+        self.assertEqual(text["reply_markup"], {"inline_keyboard": self.BUTTONS})  # to switch without scrolling up
+        self.assertEqual(self.calls("sendDocument"), [])
+        self.assertIn("Sent the report (report:all) to chat 987654321", sys.stdout.getvalue())
+
+    def test_storage_button_shows_its_hours_and_colours(self):
+        self.write_history()
+        self.run_bot([self.tap(1, "report:iPhone 18 Pro Max 512GB"), self.tap(2, "report:iPhone 18 Pro Max 1TB")])
+        first, second = (check_html(m["text"]) for m in self.world.sent())
+        self.assertEqual(first, "\n".join([
+            "📊 iPhone 18 Pro Max 512GB",
+            "Период: 03.10 07:00 – 03.10 07:16 (HKT), проверок: 3",
+            "",
+            "🕐 В какие часы появляется (HKT, число появлений):",
+            "07:00–08:00  ██████████ 1  🩶1",
+            "",
+            "Появления (появилось → закончилось, сколько держалось):",
+            "🩶 512GB · Silver — 1 раз:",
+            "   03.10 07:12 → 07:16 (4 мин)",
+            "",
+            "🏬 Где появлялось (число появлений): Canton Road 1",
+        ]))
+        self.assertEqual(second, "📊 iPhone 18 Pro Max 1TB\nПериод: 03.10 07:00 – 03.10 07:16 (HKT), проверок: 3\n\n"
+                                 "➖ Ни разу не появлялись: 1TB · Burgundy")
+        self.assertEqual(len(self.calls("answerCallbackQuery")), 2)
+
+    def test_strange_buttons(self):
+        self.write_history()
+        self.run_bot([self.tap(1, "report:all", chat=555), self.tap(2, "something else"),
+                      self.tap(3, "report:iPhone 99 1TB")])
+        self.assertEqual(len(self.calls("answerCallbackQuery")), 3)  # every spinner stops
+        [reply] = self.world.sent()  # a button from an old watch list: the whole report
+        self.assertEqual(reply["chat_id"], "987654321")
+        self.assertTrue(check_html(reply["text"]).startswith("📊 История наличия в Apple Store Hong Kong"))
+        self.assertIn("Ignored a report button from chat 555", sys.stdout.getvalue())
+
+    def test_an_old_button_still_works(self):
+        self.write_history()
+        original = self.world.telegram
+
+        def telegram(url, data):  # Telegram refuses to stop the spinner of an old tap
+            if url.endswith("/answerCallbackQuery"):
+                self.world.telegram_errors = [(400, "Bad Request: query is too old and response timeout expired", None)]
+            return original(url, data)
+
+        self.world.telegram = telegram
+        self.run_bot([self.tap(1, "report:all")])
+        self.assertEqual(len(self.world.sent()), 1)
+        self.assertIn("could not answer a button", self.stderr())
+
+    def test_buttons_for_several_models_fit_telegram(self):
+        groups = [("iPhone 18 Pro", "256GB"), ("iPhone 18 Pro", "1TB"), ("iPhone 18 Pro Max", "2TB")]
+        rows = self.cs.report_buttons(groups)
+        self.assertEqual([[b["text"] for b in row] for row in rows], [["18 Pro 256GB", "18 Pro 1TB"], ["18 Pro Max 2TB"], ["Все"]])
+        long_key = self.cs.report_key(("iPhone " + "Ultra Wide " * 10, "2TB"))
+        self.assertLessEqual(len(long_key.encode("utf-8")), 64)
 
     def test_report_with_an_empty_history(self):
         self.run_bot([self.message(1, "/report")])
@@ -1090,7 +1160,6 @@ class TelegramBot(Base):
         self.write_history()
         self.run_bot([self.message(1, "/report", chat=555)])
         self.assertEqual(self.world.sent(), [])
-        self.assertEqual(self.calls("sendDocument"), [])
 
     def test_bot_flag(self):
         with mock.patch.object(self.cs, "run_bot", return_value=0) as run, \
@@ -1228,6 +1297,51 @@ class Report(Base):
             "iPhone 18 Pro Max 2TB Burgundy": ["ifc mall"],
         })
         self.assertEqual(entries[1]["in_stock"], {})
+
+    def test_groups_in_watch_order(self):
+        watched, _ = self.sr.load([self.sample()])
+        self.assertEqual(self.sr.groups(watched), [("iPhone 18 Pro Max", "512GB"), ("iPhone 18 Pro Max", "1TB"),
+                                                   ("iPhone 18 Pro Max", "2TB")])
+
+    def test_one_storage_shows_the_hours_first_with_the_colours(self):
+        watched, checks = self.sr.load([self.sample()])
+        self.assertEqual(self.sr.group_report(watched, checks, ("iPhone 18 Pro Max", "512GB")), "\n".join([
+            "📊 iPhone 18 Pro Max 512GB",
+            "Период: 03.10 06:00 – 03.10 10:00 (HKT), проверок: 7",
+            "",
+            "🕐 В какие часы появляется (HKT, число появлений):",
+            "07:00–08:00  ██████████ 1  🩶1",
+            "09:00–10:00  ██████████ 1  🩶1",
+            "",
+            "Появления (появилось → закончилось, сколько держалось):",
+            "🩶 512GB · Silver — 2 раза:",
+            "   03.10 07:05 → 07:20 (15 мин)",
+            "   03.10 09:30 → сейчас в наличии",
+            "",
+            "➖ Ни разу не появлялись: 512GB · Black",
+            "",
+            "🏬 Где появлялось (число появлений): ifc mall 2, Causeway Bay 1",
+        ]))
+        text = self.sr.group_report(watched, checks, ("iPhone 18 Pro Max", "2TB"))  # in stock since the start
+        self.assertNotIn("🕐", text)
+        self.assertIn("🖤 2TB · Black — 1 раз:\n   с начала наблюдений → сейчас в наличии", text)
+
+    def test_colours_of_each_hour(self):
+        S, B, G = "iPhone 18 Pro Max 1TB Silver", "iPhone 18 Pro Max 1TB Black", "iPhone 18 Pro Max 1TB Glacier"
+        path = self.write(
+            {"time": self.at("06:00"), "watched": [S, B, G]},
+            {"time": self.at("06:00"), "stores": 6, "in_stock": {}},
+            {"time": self.at("07:01"), "stores": 6, "in_stock": {S: ["ifc mall"], B: ["ifc mall"]}},
+            {"time": self.at("07:30"), "stores": 6, "in_stock": {}},
+            {"time": self.at("07:40"), "stores": 6, "in_stock": {B: ["Canton Road"]}},
+            {"time": self.at("08:10"), "stores": 6, "in_stock": {G: ["apm Hong Kong"]}},
+            {"time": self.at("08:20"), "stores": 6, "in_stock": {}},
+        )
+        watched, checks = self.sr.load([path])
+        text = self.sr.group_report(watched, checks, ("iPhone 18 Pro Max", "1TB"))
+        self.assertIn("07:00–08:00  ██████████ 3  🩶1 🖤2\n08:00–09:00  ███ 1  🩵1\n", text)
+        self.assertNotIn("➖", text)
+        self.assertNotIn("🩶 1TB · Silver — 1 раз", self.sr.group_report(watched, checks, ("iPhone 18 Pro Max", "2TB")))
 
     def test_history_written_by_checks_feeds_the_report(self):
         self.world.stock = {("R409", "MJY34ZA/A")}
