@@ -755,22 +755,25 @@ def check_once(parts, state, dry_run, prefix=""):
 class Status:
     """A quiet summary of everything watched every `minutes` minutes on the clock (10:00,
     10:10, …): sent with the first check of a new period that reported no change, with how
-    many checks there were since the last one."""
+    many checks there were since the last one (or since the start)."""
 
     def __init__(self, minutes):
         self.minutes = minutes
         self.period = None
+        self.since = None  # time of the first check counted
         self.counts = Counter()
 
     def after_check(self, result, parts, reported, dry_run, source=None, sources=()):
         """Call with every fresh answer from Apple; `sources` are all computers that check."""
         if not self.minutes:
             return
-        period = int((result.checked_at or utc_now()).timestamp() // (self.minutes * 60))
+        moment = result.checked_at or utc_now()
+        period = int(moment.timestamp() // (self.minutes * 60))
         if self.period is None:
-            self.period = period
+            self.period, self.since = period, moment
         if period != self.period and not reported:
-            footer = f"🔁 Проверок за {self.minutes} мин: {sum(self.counts.values())}"
+            minutes = max(1, round((moment - self.since).total_seconds() / 60))
+            footer = f"🔁 Проверок за {minutes} мин: {sum(self.counts.values())}"
             if len(sources) > 1:
                 footer += " — " + ", ".join(f"{source_name(s)} {self.counts[s]}" for s in sources)
             message = status_message(result, parts, footer)
@@ -782,7 +785,7 @@ class Status:
                     log("Status sent to Telegram.")
                 except Exception as exc:
                     log(f"ERROR: could not send the status: {exc}", error=True)
-            self.period = period
+            self.period, self.since = period, moment
             self.counts.clear()
         self.counts[source] += 1
 
