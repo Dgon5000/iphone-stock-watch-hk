@@ -1,14 +1,14 @@
 name: iPhone Stock Watch (Apple Store Hong Kong)
 
-# GitHub's own schedule starts runs late (often 15-20 minutes apart), so this job
-# keeps running and checks every CHECK_INTERVAL_SECONDS itself. Near GitHub's
-# 6-hour job limit it starts the next run; the watchdog workflow restarts the
-# chain if it ever breaks.
+# GitHub's half of the checks: Apple at :30 of every minute, between the server's own
+# checks at :00, each answer handed to the server over SSH. Only the server sends to
+# Telegram and keeps the history, so nothing arrives twice. Near GitHub's 6-hour job
+# limit the job starts the next run; the watchdog workflow restarts the chain if it breaks.
 on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
   actions: write
 
 concurrency:
@@ -24,46 +24,42 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v7
 
-      - name: Watch Apple Store Hong Kong pickup stock
+      - name: Set up SSH to the server
+        env:
+          FEED_SSH_KEY: ${{ secrets.FEED_SSH_KEY }}
+          FEED_HOST: ${{ secrets.FEED_HOST }}
+          FEED_KNOWN_HOSTS: ${{ secrets.FEED_KNOWN_HOSTS }}
+        shell: bash
+        run: |
+          if [ -z "$FEED_SSH_KEY" ] || [ -z "$FEED_HOST" ] || [ -z "$FEED_KNOWN_HOSTS" ]; then
+            echo "::error::The secrets FEED_SSH_KEY, FEED_HOST and FEED_KNOWN_HOSTS are needed (see README)."
+            exit 1
+          fi
+          install -d -m 700 ~/.ssh
+          (umask 077 && printf '%s\n' "$FEED_SSH_KEY" > ~/.ssh/feed_key && printf '%s\n' "$FEED_KNOWN_HOSTS" > ~/.ssh/known_hosts)
+          # One connection for the whole run; every check is a short session over it.
+          cat > ~/.ssh/config <<EOF
+          Host feed
+            HostName $FEED_HOST
+            User stockfeed
+            IdentityFile ~/.ssh/feed_key
+            IdentitiesOnly yes
+            BatchMode yes
+            StrictHostKeyChecking yes
+            ConnectTimeout 20
+            ServerAliveInterval 15
+            ServerAliveCountMax 3
+            ControlMaster auto
+            ControlPath ~/.ssh/feed-%C
+            ControlPersist 10m
+          EOF
+
+      - name: Check Apple at :30 of every minute and hand each check to the server
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           PART_NUMBERS: ${{ vars.PART_NUMBERS }}
-          CHECK_INTERVAL_SECONDS: ${{ vars.CHECK_INTERVAL_SECONDS || '300' }}
-          RUN_MINUTES: "330"
-        shell: bash
-        run: |
-          case "$CHECK_INTERVAL_SECONDS" in
-            '' | *[!0-9]*) echo "::error::CHECK_INTERVAL_SECONDS must be a whole number of seconds."; exit 1 ;;
-          esac
-          if [ "$CHECK_INTERVAL_SECONDS" -lt 30 ]; then
-            echo "::error::CHECK_INTERVAL_SECONDS must be at least 30."
-            exit 1
-          fi
-
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          save_state() {
-            if [ -n "$(git status --porcelain -- stock_state.json)" ]; then
-              git add stock_state.json
-              git commit -q -m "Update Apple HK stock state [skip ci]"
-              git push -q || { git pull -q --rebase && git push -q; } || echo "::warning::Could not push the stock state; will retry after the next check."
-            fi
-          }
-
-          deadline=$((SECONDS + RUN_MINUTES * 60))
-          while true; do
-            # Pick up files changed on GitHub (e.g. a new check_stock.py) without a restart.
-            git pull -q --rebase || { git rebase --abort 2>/dev/null; true; }
-            # The script reports lasting failures to Telegram itself; keep watching.
-            python3 -u check_stock.py || true
-            save_state
-            if [ $((SECONDS + CHECK_INTERVAL_SECONDS)) -ge "$deadline" ]; then
-              break
-            fi
-            sleep "$CHECK_INTERVAL_SECONDS"
-          done
+        run: python3 -u check_stock.py --probe feed --every 60 --offset 30 --minutes 330
 
       - name: Start the next run
         env:

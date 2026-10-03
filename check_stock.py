@@ -4,16 +4,24 @@
 Checks in-store pickup availability of the watched iPhone part numbers at every
 Apple Store in Hong Kong and sends one Telegram alert when a configuration comes
 into stock at any of them.
+
+Two computers can share the checks: the server checks at :00 of every minute
+(--watch --every 60 --inbox DIR) and GitHub at :30 (--probe), handing each answer
+to the server over SSH (--ingest). Only the server decides what to send, so nothing
+arrives twice, and it keeps the history of both.
 """
 import argparse
 import itertools
 import json
+import math
 import os
 import re
 import ssl
+import subprocess
 import sys
 import time
 import uuid
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
@@ -55,14 +63,26 @@ TELEGRAM_MAX_LENGTH = 4000  # Telegram allows 4096 characters per message.
 # Report a broken watcher to Telegram only once it has been failing this long.
 PROBLEM_ALERT_AFTER = timedelta(minutes=30)
 # While Apple releases stock its answers flicker ("in stock", nothing, "in stock"
-# seconds apart), so a sell-out is reported only if a second look this much later agrees.
+# seconds apart), so a sell-out is reported only if another check this much later agrees.
 CONFIRM_DELAY_SECONDS = 20
-# Pauses between checks in --watch mode, in minutes, used in turn, and after how many
-# full rounds of them a quiet status of everything watched is sent (0: never).
+# Pauses between checks in --watch mode, in minutes, used in turn (--every sets fixed times
+# instead), and a quiet status of everything watched every this many minutes (0: never).
 DEFAULT_SCHEDULE = "1,2,3"
-DEFAULT_STATUS_ROUNDS = 3
+DEFAULT_STATUS_MINUTES = 10
 # A request that fails on the network (timeout, reset) is tried once more after this pause.
 NETWORK_RETRY_SECONDS = 5
+# When Apple refuses requests (HTTP 403 or 429), the computer pauses its checks for 2, 4, 8
+# and then at most 15 minutes instead of insisting.
+REFUSED_CODES = (403, 429)
+MAX_REFUSED_PAUSE_SECONDS = 15 * 60
+# Checks handed in by another computer (--probe → --ingest → --watch --inbox): at most this
+# big, at most this many waiting, and read by the watcher within INBOX_STALE_SECONDS. The
+# checking as a whole works while some computer had an answer from Apple this recently.
+MAX_CHECK_BYTES = 64 * 1024
+INBOX_LIMIT = 500
+INBOX_STALE_SECONDS = 300
+WORKING_WINDOW = timedelta(minutes=3)
+SOURCE_NAMES = {"vps": "VPS", "github": "GitHub", "mac": "Mac"}
 # Telegram bot (--bot): commands in the bot's menu, commands older than this are ignored
 # (sent while the bot was down), and repeated /iphone within this time reuse the last answer.
 BOT_COMMANDS = [
@@ -104,6 +124,18 @@ class CheckResult:
     available: list  # one dict per (store, part) with pickup stock
     missing_parts: list  # watched parts Apple returned no record for
     checked_at: object = None  # Apple's own time of the answer (aware datetime), if it sent one
+
+
+class AppleHTTPError(RuntimeError):
+    """Apple answered with an HTTP error status (`code`)."""
+
+    def __init__(self, code):
+        super().__init__(f"Apple returned HTTP {code}; not treating this as out of stock.")
+        self.code = code
+
+
+def utc_now():
+    return datetime.now(timezone.utc)
 
 
 def now_hkt():
@@ -171,6 +203,11 @@ def color_emoji(color):
         if word in COLOR_EMOJI:
             return COLOR_EMOJI[word]
     return "🎨"
+
+
+def source_name(source):
+    """How a checking computer is called in logs and messages: "github" -> GitHub."""
+    return SOURCE_NAMES.get(source, source)
 
 
 def read_state():
@@ -251,7 +288,8 @@ def request_stores(parts):
                 raw = response.read()
             break
         except HTTPError as exc:
-            raise RuntimeError(f"Apple returned HTTP {exc.code}; not treating this as out of stock.") from exc
+            exc.close()  # only the status matters; free the connection now
+            raise AppleHTTPError(exc.code) from exc
         except OSError as exc:  # URLError, timeouts, connection resets: usually gone a moment later
             reason = getattr(exc, "reason", exc)
             if attempt == 1:
@@ -261,7 +299,7 @@ def request_stores(parts):
             raise RuntimeError(f"Could not reach Apple: {reason}; not treating this as out of stock.") from exc
 
     if status != 200:
-        raise RuntimeError(f"Apple returned HTTP {status}; not treating this as out of stock.")
+        raise AppleHTTPError(status)
 
     try:
         payload = json.loads(raw.decode("utf-8"))
@@ -437,6 +475,16 @@ def send_telegram(text, silent=False, chat_ids=None):
             )
 
 
+def tell(text):
+    """send_telegram for notices about the watcher itself; True if it went out."""
+    try:
+        send_telegram(text)
+        return True
+    except Exception as exc:
+        log(f"ERROR: could not send a notice to Telegram: {exc}", error=True)
+        return False
+
+
 def config_blocks(items, status=None, title="📱"):
     """Per model a bold "<title> <model>" header, then one line per configuration
     (colour emoji, storage, colour and status(item) if given) with a blank line
@@ -463,7 +511,7 @@ def checkout_link(item):
 
 def checked_at(moment=None):
     """The check time in Hong Kong; pass Apple's time when known, since server clocks drift."""
-    return f"🕐 Проверено: {(moment or datetime.now(timezone.utc)).astimezone(HKT):%d.%m.%Y %H:%M} (HKT)"
+    return f"🕐 Проверено: {(moment or utc_now()).astimezone(HKT):%d.%m.%Y %H:%M} (HKT)"
 
 
 def change_message(appeared, sold_out, parts, moment=None):
@@ -501,8 +549,9 @@ def unavailable_summary(missing, watched):
     return "; ".join(pieces)
 
 
-def status_message(result, parts):
-    """Everything watched: what is in stock now (with links) and, in one line, what is not."""
+def status_message(result, parts, footer=None):
+    """Everything watched: what is in stock now (with links) and, in one line, what is not.
+    `footer` goes under the check time."""
     in_stock = {item["partNumber"] for item in result.available}
     watched = [{"partNumber": p, "product": result.products[p]} for p in parts if p in result.products]
     available = [item for item in watched if item["partNumber"] in in_stock]
@@ -514,7 +563,7 @@ def status_message(result, parts):
         blocks.append("Сейчас ничего из отслеживаемого нет в наличии.")
     if missing:
         blocks.append(f"➖ Нет в наличии: {unavailable_summary(missing, watched)}")
-    blocks.append(checked_at(result.checked_at))
+    blocks.append(checked_at(result.checked_at) + (f"\n{footer}" if footer else ""))
     return "\n\n".join(blocks)
 
 
@@ -541,7 +590,7 @@ def actions_run_url():
 def report_health(state, problem):
     """Tell Telegram once when the watcher has been broken for a while and once when it recovers."""
     known = state.get("problem") if isinstance(state.get("problem"), dict) else None
-    now = datetime.now(timezone.utc)
+    now = utc_now()
 
     if problem is None:
         if known and known.get("notified"):
@@ -577,23 +626,27 @@ def report_health(state, problem):
 _history_started = False
 
 
-def record_history(result=None, error=None):
-    """Append one check to HISTORY_FILE: the time (Hong Kong) and which configurations were
-    in stock in which stores, or the error. The first line of each run lists what is watched."""
+def record_history(result=None, error=None, source=None, moment=None):
+    """Append one check to HISTORY_FILE: the time (Hong Kong), the computer that checked (when
+    several do) and which configurations were in stock in which stores, or the error. The first
+    line of each run lists what is watched."""
     global _history_started
-    moment = (result.checked_at if result and result.checked_at else datetime.now(timezone.utc)).astimezone(HKT)
+    moment = (moment or (result.checked_at if result else None) or utc_now()).astimezone(HKT)
+    stamp = {"time": moment.isoformat(timespec="seconds")}
+    if source:
+        stamp["source"] = source
     lines = []
     if result is None:
-        lines.append({"time": moment.isoformat(timespec="seconds"), "error": str(error)[:300]})
+        lines.append({**stamp, "error": str(error)[:300]})
     else:
         if not _history_started:
-            lines.append({"time": moment.isoformat(timespec="seconds"), "watched": list(result.products.values())})
+            lines.append({"time": stamp["time"], "watched": list(result.products.values())})
             _history_started = True
         in_stock = {}
         for item in result.available:
             in_stock.setdefault(item["product"], []).append(item["storeName"])
         lines.append({
-            "time": moment.isoformat(timespec="seconds"),
+            **stamp,
             "stores": result.store_count,
             "in_stock": {product: sorted(stores, key=str.lower) for product, stores in in_stock.items()},
         })
@@ -632,48 +685,41 @@ def confirm_sold_out(parts, gone, record=True):
     return confirmed
 
 
-def check_once(parts, state, dry_run, prefix=""):
-    """One check: tell Telegram what came into stock or sold out, then update the state.
-    Returns (Apple's answer or None, whether a change was reported, whether an alert failed or
-    a part number is unknown, the problem for report_health)."""
-    try:
-        result = observe(parts, record=not dry_run)
-    except Exception as exc:
-        log(f"{prefix}ERROR: {exc}", error=True)
-        return None, False, False, f"Последняя ошибка: {exc}"
-    log(prefix + summary(result, parts))
+def missing_problem(result):
+    """The problem for report_health if Apple returned nothing for some watched part numbers."""
+    if not result.missing_parts:
+        return None
+    log(
+        f'ERROR: Apple returned no availability record for {", ".join(result.missing_parts)}. '
+        "Hong Kong part numbers look like MJXU4ZA/A; not treating this as out of stock.",
+        error=True,
+    )
+    return f'Apple не вернул данные по артикулам {", ".join(result.missing_parts)}. Проверьте PART_NUMBERS.'
 
-    failed, problem = False, None
-    if result.missing_parts:
-        failed = True
-        problem = f'Apple не вернул данные по артикулам {", ".join(result.missing_parts)}. Проверьте PART_NUMBERS.'
-        log(
-            f'ERROR: Apple returned no availability record for {", ".join(result.missing_parts)}. '
-            "Hong Kong part numbers look like MJXU4ZA/A; not treating this as out of stock.",
-            error=True,
-        )
 
+def apply_changes(result, parts, state, dry_run, confirm):
+    """Tell Telegram what came into stock or sold out since the state, then update the state.
+    `confirm(gone)` gets the configurations this check misses (maybe none) and returns the
+    sell-outs to report now. Returns (whether a change was reported, whether the alert failed)."""
     known = known_stock(state, parts)
     current = {}
     for item in result.available:
         current.setdefault(item["partNumber"], item)
     appeared = [current[part] for part in parts if part in current and part not in known]
-    sold_out = [known[part] for part in parts if part in known and part not in current]
-    if sold_out:
-        sold_out = confirm_sold_out(parts, sold_out, record=not dry_run)
+    sold_out = confirm([known[part] for part in parts if part in known and part not in current])
 
     if appeared or sold_out:
         log(f"CHANGES: {len(appeared)} came into stock, {len(sold_out)} sold out.")
         message = change_message(appeared, sold_out, parts, result.checked_at)
         if dry_run:
             print(f"--- dry run, Telegram message not sent ---\n{message}\n---", flush=True)
-            return result, True, failed, problem
+            return True, False
         try:
             send_telegram(message)
         except Exception as exc:
             # Keep the old state so the next check reports the changes again.
             log(f"ERROR: could not send the Telegram alert: {exc}", error=True)
-            return result, False, True, problem
+            return False, True
         log("Telegram alert sent.")
     elif current:
         log(f"No changes: {len(current)} configuration(s) still in stock.")
@@ -684,16 +730,71 @@ def check_once(parts, state, dry_run, prefix=""):
         state.update(part_numbers=parts, location=LOCATION, available=stock_snapshot(still + appeared))
         state.pop("recently_gone", None)  # used by older versions
         write_state(state)
-    return result, bool(appeared or sold_out), failed, problem
+    return bool(appeared or sold_out), False
 
 
-def run_checks(parts, checks, pauses, dry_run, status_every=0):
+def check_once(parts, state, dry_run, prefix=""):
+    """One check: tell Telegram what came into stock or sold out, then update the state.
+    Returns (Apple's answer or None, whether a change was reported, whether an alert failed or
+    a part number is unknown, the problem for report_health)."""
+    try:
+        result = observe(parts, record=not dry_run)
+    except Exception as exc:
+        log(f"{prefix}ERROR: {exc}", error=True)
+        return None, False, False, f"Последняя ошибка: {exc}"
+    log(prefix + summary(result, parts))
+    problem = missing_problem(result)
+
+    def second_look(gone):
+        return confirm_sold_out(parts, gone, record=not dry_run) if gone else []
+
+    reported, alert_failed = apply_changes(result, parts, state, dry_run, second_look)
+    return result, reported, alert_failed or problem is not None, problem
+
+
+class Status:
+    """A quiet summary of everything watched every `minutes` minutes on the clock (10:00,
+    10:10, …): sent with the first check of a new period that reported no change, with how
+    many checks there were since the last one."""
+
+    def __init__(self, minutes):
+        self.minutes = minutes
+        self.period = None
+        self.counts = Counter()
+
+    def after_check(self, result, parts, reported, dry_run, source=None, sources=()):
+        """Call with every fresh answer from Apple; `sources` are all computers that check."""
+        if not self.minutes:
+            return
+        period = int((result.checked_at or utc_now()).timestamp() // (self.minutes * 60))
+        if self.period is None:
+            self.period = period
+        if period != self.period and not reported:
+            footer = f"🔁 Проверок за {self.minutes} мин: {sum(self.counts.values())}"
+            if len(sources) > 1:
+                footer += " — " + ", ".join(f"{source_name(s)} {self.counts[s]}" for s in sources)
+            message = status_message(result, parts, footer)
+            if dry_run:
+                print(f"--- dry run, status not sent ---\n{message}\n---", flush=True)
+            else:
+                try:
+                    send_telegram(message, silent=True)
+                    log("Status sent to Telegram.")
+                except Exception as exc:
+                    log(f"ERROR: could not send the status: {exc}", error=True)
+            self.period = period
+            self.counts.clear()
+        self.counts[source] += 1
+
+
+def run_checks(parts, checks, pauses, dry_run, status_minutes=0):
     """Run `checks` checks (None: forever), pausing between them for the seconds in
-    `pauses` (a number or a list used in turn). Every `status_every` full rounds of pauses
-    (0: never) a quiet summary of everything watched follows. Return the process exit code."""
+    `pauses` (a number or a list used in turn), with a quiet status of everything watched
+    every `status_minutes` (0: never). Return the process exit code."""
     pauses = list(pauses) if isinstance(pauses, (list, tuple)) else [pauses]
     schedule = itertools.cycle(pauses)
     state = read_state()
+    status = Status(status_minutes)
     answered = 0
     failed = False
     n = 0
@@ -711,24 +812,351 @@ def run_checks(parts, checks, pauses, dry_run, status_every=0):
         failed = failed or alert_failed
         if not dry_run:
             report_health(state, problem)
-
-        pauses_taken = n - 1
-        rounds_done = pauses_taken // len(pauses) if pauses_taken % len(pauses) == 0 else 0
-        if status_every and rounds_done and rounds_done % status_every == 0 and result and not reported:
-            message = status_message(result, parts)
-            if dry_run:
-                print(f"--- dry run, status not sent ---\n{message}\n---", flush=True)
-                continue
-            try:
-                send_telegram(message, silent=True)
-                log("Status sent to Telegram.")
-            except Exception as exc:
-                log(f"ERROR: could not send the status: {exc}", error=True)
+        if result:
+            status.after_check(result, parts, reported, dry_run)
 
     if not answered:
         log("ERROR: every check failed; Apple may be blocking requests or the endpoint changed.", error=True)
         return 1
     return 1 if failed else 0
+
+
+def next_slot(now, every, offset=0):
+    """The first moment after `now` (Unix time) that is `offset` seconds past a multiple of
+    `every` seconds: next_slot(t, 60, 30) is the next :30 of a minute."""
+    return (math.floor((now - offset) / every) + 1) * every + offset
+
+
+class Backoff:
+    """When Apple refuses (HTTP 403 or 429), check less: none for 2, 4, 8, then 15 minutes."""
+
+    def __init__(self):
+        self.refusals, self.until = 0, 0.0
+
+    def allows(self, moment):
+        return moment >= self.until
+
+    def look(self, parts):
+        """fetch_stock, learning from how Apple answered: (result, None) or (None, error)."""
+        try:
+            result = fetch_stock(parts)
+        except Exception as exc:
+            if getattr(exc, "code", None) in REFUSED_CODES:
+                self.refusals += 1
+                pause = min(60 * 2 ** self.refusals, MAX_REFUSED_PAUSE_SECONDS)
+                self.until = time.time() + pause
+                log(f"Apple refused the request (HTTP {exc.code}); no checks from here for {pause // 60} min.", error=True)
+            return None, exc
+        self.refusals, self.until = 0, 0.0
+        return result, None
+
+
+class SellOuts:
+    """With checks every half minute a sell-out needs no extra request: it is reported when two
+    checks in a row, at least CONFIRM_DELAY_SECONDS apart, miss the configuration."""
+
+    def __init__(self):
+        self.missing_since = {}  # part number -> Apple's time of the first check without it
+        self.confirmed = set()
+
+    def confirm(self, gone, moment):
+        """Call with every check's would-be sell-outs (maybe none); returns those to report."""
+        missing = {item["partNumber"] for item in gone}
+        back = [part for part in self.missing_since if part not in missing and part not in self.confirmed]
+        if back:
+            log(f"{len(back)} configuration(s) were back at the next check (Apple flicker); not reported.")
+        self.missing_since = {part: self.missing_since.get(part, moment) for part in missing}
+        confirmed = [
+            item for item in gone
+            if (moment - self.missing_since[item["partNumber"]]).total_seconds() >= CONFIRM_DELAY_SECONDS
+        ]
+        self.confirmed = {item["partNumber"] for item in confirmed}
+        if len(confirmed) < len(gone):
+            log(f"{len(gone) - len(confirmed)} configuration(s) missing; reported as sold out if the next check agrees.")
+        return confirmed
+
+
+class Sources:
+    """The computers that check (this server, GitHub, …) and when each last had an answer
+    from Apple. Tells Telegram once when one has had none for PROBLEM_ALERT_AFTER while
+    another still works, and once when it is back; if none works, that is report_health's."""
+
+    def __init__(self, state, now):
+        self.state = state
+        self.since = {s: now for s in state.get("sources") or [] if isinstance(s, str)}
+        self.ok = {}
+        self.errors = {}
+
+    def names(self):
+        return list(self.since)
+
+    def seen(self, source, moment, error=None):
+        if source not in self.since:
+            self.since[source] = moment
+            self.state["sources"] = sorted(self.since)
+        if error is None:
+            self.ok[source] = max(self.ok.get(source, moment), moment)
+            self.errors.pop(source, None)
+        else:
+            self.errors[source] = str(error)
+
+    def working(self, now, window=PROBLEM_ALERT_AFTER):
+        return [source for source, moment in self.ok.items() if now - moment < window]
+
+    def report(self, now):
+        down = [s for s in self.state.get("down") or [] if s in self.since]
+        working = self.working(now)
+        for source in self.since:
+            name = source_name(source)
+            if source in working:
+                if source in down and tell(f"✅ {name}: проверки снова работают."):
+                    down.remove(source)
+                continue
+            silent = now - self.ok.get(source, self.since[source])
+            if source in down or not working or silent < PROBLEM_ALERT_AFTER:
+                continue
+            minutes = int(silent.total_seconds() // 60)
+            error = self.errors.get(source)
+            text = f"⚠️ {name}: проверки {'не работают' if error else 'не приходят'} уже {minutes} мин. "
+            text += f"Наличие продолжает проверять {', '.join(source_name(s) for s in working)}."
+            if error:
+                text += f"\n\nПоследняя ошибка: {escape(error)}"
+            if tell(text):
+                down.append(source)
+        self.state["down"] = down or None
+        write_state(self.state)
+
+
+class Watcher:
+    """--watch --every: this computer's checks and those other computers hand in (--inbox),
+    all against one state, so each change is reported once and every check is in the history."""
+
+    def __init__(self, parts, dry_run, status_minutes, source):
+        self.parts, self.dry_run, self.source = parts, dry_run, source
+        self.state = read_state()
+        self.sell_outs = SellOuts()
+        self.status = Status(status_minutes)
+        self.sources = Sources(self.state, utc_now())
+        self.latest = None  # Apple's time of the newest check acted upon
+        self.stuck = set()  # inbox files that could not be removed
+
+    def take_inbox(self, inbox):
+        """Handle the checks other computers handed in, oldest first, and remove them."""
+        for path in sorted(Path(inbox).glob("*.json")):
+            if path.name in self.stuck:
+                continue
+            try:
+                source, moment, result, error = check_from_json(json.loads(path.read_text(encoding="utf-8")))
+                if moment > utc_now() + timedelta(minutes=2):
+                    raise ValueError("its time is in the future")
+            except Exception as exc:
+                log(f"ERROR: ignored {path.name} from the inbox: {exc}", error=True)
+                source = None
+            try:
+                path.unlink()
+            except OSError as exc:
+                log(f"ERROR: could not remove {path.name} from the inbox: {exc}", error=True)
+                self.stuck.add(path.name)
+            if source:
+                self.handle(source, moment, result, error)
+
+    def handle(self, source, moment, result=None, error=None):
+        """One check by `source` at `moment`: Apple's answer or the error."""
+        label = source_name(source)
+        if not self.dry_run:
+            record_history(result, error, source, moment)
+        self.sources.seen(source, moment, error)
+        problem = None
+        if result is None:
+            log(f"{label}: ERROR: {error}", error=True)
+            if not self.sources.working(utc_now(), WORKING_WINDOW):
+                problem = f"Последняя ошибка: {error}"
+        else:
+            log(f"{label}: {summary(result, self.parts)}")
+            problem = missing_problem(result)
+            if set(result.products) | set(result.missing_parts) != set(self.parts):
+                log(f"ERROR: {label} checks other part numbers; its check went into the history only.", error=True)
+            elif self.latest is not None and moment <= self.latest:
+                log(f"{label}: older than the last check; it went into the history only.")
+            else:
+                self.latest = moment
+                reported, _ = apply_changes(
+                    result, self.parts, self.state, self.dry_run, lambda gone: self.sell_outs.confirm(gone, moment)
+                )
+                everyone = [self.source] + sorted(s for s in self.sources.names() if s != self.source)
+                self.status.after_check(result, self.parts, reported, self.dry_run, source, everyone)
+        if not self.dry_run:
+            report_health(self.state, problem)
+            self.sources.report(utc_now())
+
+
+def run_slots(parts, every, offset, dry_run, status_minutes=0, inbox=None, source="vps"):
+    """Check at fixed times on the clock, `offset` seconds past every multiple of `every`
+    seconds (60 and 0: at :00 of every minute), and in between handle the checks other
+    computers hand in through `inbox` (GitHub's at :30). Runs until stopped."""
+    watcher = Watcher(parts, dry_run, status_minutes, source)
+    backoff = Backoff()
+    due = next_slot(time.time(), every, offset)
+    while True:
+        while True:
+            if inbox:
+                watcher.take_inbox(inbox)
+            wait = due - time.time()
+            if wait <= 0:
+                break
+            time.sleep(min(wait, 1.0) if inbox else wait)
+        if backoff.allows(due):
+            result, error = backoff.look(parts)
+            watcher.handle(source, (result.checked_at if result else None) or utc_now(), result, error)
+        due = next_slot(time.time(), every, offset)
+
+
+def check_to_json(source, result=None, error=None, moment=None):
+    """A check as JSON-ready data, to hand it to another computer (--probe, --ingest)."""
+    moment = (result.checked_at if result else None) or moment or utc_now()
+    data = {"source": source, "time": moment.isoformat(timespec="seconds")}
+    if result is None:
+        data["error"] = " ".join(str(error).split())[:300]
+    else:
+        data.update(stores=result.store_count, products=result.products,
+                    available=result.available, missing=result.missing_parts)
+    return data
+
+
+def check_from_json(data):
+    """(source, time, CheckResult or None, error or None) from check_to_json's data, checked
+    field by field since it comes from another computer. Raises ValueError."""
+    def text(value, limit=200):
+        if not isinstance(value, str) or len(value) > limit:
+            raise ValueError(f"bad value {str(value)[:40]!r}")
+        # Like clean(): any spaces (Apple's are non-breaking) become one plain space; no line
+        # breaks or invisible marks.
+        return " ".join("".join(ch for ch in value if ch.isprintable() or ch.isspace()).split())
+
+    if not isinstance(data, dict):
+        raise ValueError("not a JSON object")
+    source = text(data.get("source"), 20)
+    if not re.fullmatch(r"[a-z0-9-]+", source):
+        raise ValueError(f"bad source {source!r}")
+    moment = parse_utc(text(data.get("time"), 40))
+    if moment is None:
+        raise ValueError("bad time")
+    if "error" in data:
+        return source, moment, None, text(data["error"], 300)
+    stores, products, available, missing = (data.get(k) for k in ("stores", "products", "available", "missing"))
+    if not isinstance(stores, int) or isinstance(stores, bool) or not 0 <= stores <= 100:
+        raise ValueError("bad store count")
+    if not isinstance(products, dict) or len(products) > 100:
+        raise ValueError("bad products")
+    products = {text(part, 20): text(title) for part, title in products.items()}
+    if not isinstance(available, list) or len(available) > 5000 or not isinstance(missing, list) or len(missing) > 100:
+        raise ValueError("bad availability")
+    fields = ("storeNumber", "storeName", "city", "partNumber", "product", "pickup")
+    checked = []
+    for item in available:
+        if not isinstance(item, dict) or item.get("partNumber") not in products:
+            raise ValueError("bad availability record")
+        checked.append({k: text(item.get(k, "")) for k in fields})
+    return source, moment, CheckResult(stores, products, checked, [text(p, 20) for p in missing], moment), None
+
+
+def oldest_age(paths):
+    """Seconds since the oldest of `paths` was written (0 if none is left)."""
+    for path in paths:
+        try:
+            return time.time() - path.stat().st_mtime
+        except FileNotFoundError:
+            continue  # just taken by the watcher
+    return 0
+
+
+def ingest(inbox, source, stream):
+    """--ingest (the server's SSH command for GitHub): save the checks sent on `stream`, one
+    JSON line each (see check_to_json), into `inbox` for --watch --inbox, as coming from
+    `source` whatever they say. Returns 1 with the reason on stderr if a check is not taken,
+    e.g. because the watcher has stopped reading the inbox, so that the sender notices."""
+    inbox = Path(inbox)
+    try:
+        for line in iter(lambda: stream.readline(MAX_CHECK_BYTES + 1), b""):
+            if len(line) > MAX_CHECK_BYTES:
+                raise ValueError("the check is too large")
+            if not line.strip():
+                continue
+            data = json.loads(line)
+            if not isinstance(data, dict):
+                raise ValueError("not a JSON object")
+            data["source"] = source
+            check_from_json(data)
+            waiting = sorted(inbox.glob("*.json"))
+            if len(waiting) >= INBOX_LIMIT:
+                raise ValueError(f"{len(waiting)} checks are waiting on the server; is the watcher running?")
+            if oldest_age(waiting) > INBOX_STALE_SECONDS:
+                minutes = int(oldest_age(waiting) // 60)
+                raise ValueError(f"the watcher on the server has not read checks for {minutes} min; is it running?")
+            name = f"{time.time_ns()}-{os.getpid()}"
+            temporary = inbox / f".{name}.tmp"
+            with open(os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o640), "w", encoding="utf-8") as f:
+                f.write(json.dumps(data, ensure_ascii=False))
+            os.replace(temporary, inbox / f"{name}.json")
+    except (OSError, ValueError) as exc:
+        print(f"ERROR: check not taken: {exc}", file=sys.stderr, flush=True)
+        return 1
+    return 0
+
+
+def deliver(feed, data):
+    """Hand one check to the server, where `ssh feed` runs --ingest. Returns None or the problem."""
+    line = json.dumps(data, ensure_ascii=False).encode("utf-8") + b"\n"
+    try:
+        done = subprocess.run(["ssh", "-T", feed], input=line, capture_output=True, timeout=45)
+    except subprocess.TimeoutExpired:
+        return "the server did not answer within 45 s"
+    except OSError as exc:
+        return f"could not run ssh: {exc}"
+    if done.returncode:
+        lines = done.stderr.decode("utf-8", "replace").strip().splitlines()
+        return lines[-1] if lines else f"ssh exited with code {done.returncode}"
+    return None
+
+
+def run_probe(parts, feed, every, offset, minutes=0, source="github"):
+    """--probe: check at fixed times on the clock like run_slots (GitHub: at :30, between the
+    server's checks) and hand every answer to the server with deliver(); the server decides
+    what to send. Stops after `minutes` (0: never). Tells Telegram once if the server has not
+    taken the checks for PROBLEM_ALERT_AFTER, and once when it takes them again."""
+    end = time.time() + minutes * 60 if minutes else None
+    backoff = Backoff()
+    failing_since, notified = None, False
+    name = source_name(source)
+    while True:
+        due = next_slot(time.time(), every, offset)
+        if end is not None and due >= end:
+            return 0
+        time.sleep(max(0.0, due - time.time()))
+        if not backoff.allows(due):
+            continue
+        result, error = backoff.look(parts)
+        if result:
+            log(summary(result, parts))
+        else:
+            log(f"ERROR: {error}", error=True)
+        problem = deliver(feed, check_to_json(source, result, error))
+        if problem is None:
+            failing_since = None
+            if notified and tell(f"✅ {name} снова передаёт проверки на сервер."):
+                notified = False
+            continue
+        log(f"ERROR: could not hand the check to the server: {problem}", error=True)
+        failing_since = failing_since or utc_now()
+        if not notified and utc_now() - failing_since >= PROBLEM_ALERT_AFTER:
+            minutes_down = int((utc_now() - failing_since).total_seconds() // 60)
+            text = (
+                f"⚠️ {name} не может передать проверки на сервер уже {minutes_down} мин. Если сервер "
+                f"не работает, уведомления о наличии сейчас не придут.\n\n{escape(problem)}"
+            )
+            if actions_run_url():
+                text += f'\n\n<a href="{escape(actions_run_url())}">Лог запуска</a>'
+            notified = tell(text)
 
 
 def answer_command(token, allowed, message, parts, cache):
@@ -860,21 +1288,30 @@ def main():
         nargs="?",
         const="",
         metavar="MINUTES",
-        help=f"check forever, pausing these minutes in turn (default: CHECK_SCHEDULE_MINUTES or {DEFAULT_SCHEDULE})",
+        help=f"check forever, pausing these minutes in turn (default: CHECK_SCHEDULE_MINUTES or {DEFAULT_SCHEDULE}), or at fixed times with --every",
     )
+    parser.add_argument("--every", type=int, metavar="SECONDS", help="with --watch or --probe: check at fixed times, every SECONDS on the clock")
+    parser.add_argument("--offset", type=int, default=0, metavar="SECONDS", help="with --every: that many seconds past those times (30: at :30 of every minute)")
     parser.add_argument(
-        "--status-every",
+        "--status-minutes",
         type=int,
-        default=DEFAULT_STATUS_ROUNDS,
-        metavar="ROUNDS",
-        help=f"with --watch: a quiet status after every ROUNDS full rounds of pauses, 0 = never (default {DEFAULT_STATUS_ROUNDS})",
+        default=DEFAULT_STATUS_MINUTES,
+        metavar="N",
+        help=f"with --watch: a quiet status every N minutes, 0 = never (default {DEFAULT_STATUS_MINUTES})",
     )
+    parser.add_argument("--inbox", metavar="DIR", help="with --watch --every: also handle the checks another computer hands in through DIR (see --ingest)")
+    parser.add_argument("--source", metavar="NAME", help="this computer's name in logs, history and messages (default: vps; github for --probe and --ingest)")
+    parser.add_argument("--probe", metavar="HOST", help="with --every: check and hand every answer to the server, where `ssh HOST` runs --ingest")
+    parser.add_argument("--minutes", type=int, default=0, metavar="N", help="with --probe: stop after N minutes (default: never)")
+    parser.add_argument("--ingest", metavar="DIR", help="save the checks sent on stdin into DIR for --watch --inbox (the server's SSH command)")
     parser.add_argument("--dry-run", action="store_true", help="print alerts instead of sending them; keep the state file")
     parser.add_argument("--test-telegram", action="store_true", help="send a test Telegram message and exit")
     parser.add_argument("--status", action="store_true", help="send what is in stock now to Telegram and exit")
     parser.add_argument("--bot", action="store_true", help="answer the /iphone command in Telegram (runs until stopped)")
     args = parser.parse_args()
 
+    if args.ingest:
+        return ingest(args.ingest, args.source or "github", sys.stdin.buffer)
     parts = configured_parts()
     if args.test_telegram:
         send_test_message(parts)
@@ -885,16 +1322,30 @@ def main():
         send_telegram(status_message(fetch_stock(parts), parts))
         log("Status sent to Telegram.")
         return 0
+    if args.every is not None and (args.every < 10 or not 0 <= args.offset < args.every):
+        parser.error("--every must be at least 10 seconds and --offset from 0 to less than --every")
+    if args.probe:
+        if args.every is None or args.minutes < 0:
+            parser.error("--probe needs --every, and --minutes must be 0 or more")
+        until = f" for {args.minutes} min" if args.minutes else ""
+        log(f"Checking {len(parts)} configurations every {args.every} s, {args.offset} s past the clock{until}; "
+            f"every check goes to the server through ssh {args.probe}.")
+        return run_probe(parts, args.probe, args.every, args.offset, args.minutes, args.source or "github")
     if args.watch is not None:
-        if args.status_every < 0:
-            parser.error("--status-every must be 0 or more")
+        if args.status_minutes < 0:
+            parser.error("--status-minutes must be 0 or more")
+        status = f"a quiet status every {args.status_minutes} min." if args.status_minutes else "no status messages."
+        if args.every is not None:
+            inbox = f" plus the checks handed in through {args.inbox}" if args.inbox else ""
+            log(f"Watching {len(parts)} configurations: a check every {args.every} s, {args.offset} s past the clock"
+                f"{inbox}; {status}")
+            return run_slots(parts, args.every, args.offset, args.dry_run, args.status_minutes, args.inbox, args.source or "vps")
         pauses = parse_schedule(args.watch or os.environ.get("CHECK_SCHEDULE_MINUTES") or DEFAULT_SCHEDULE)
         minutes = ", ".join(f"{p / 60:g}" for p in pauses)
-        status = "no status messages."
-        if args.status_every:
-            status = f"a quiet status every {args.status_every} round(s), {sum(pauses) * args.status_every / 60:g} min."
         log(f"Watching {len(parts)} configurations; pauses of {minutes} min in turn; {status}")
-        return run_checks(parts, None, pauses, args.dry_run, args.status_every)
+        return run_checks(parts, None, pauses, args.dry_run, args.status_minutes)
+    if args.inbox or args.every is not None:
+        parser.error("--every and --inbox need --watch (or --probe)")
     if args.checks < 1 or args.interval < 10:
         parser.error("--checks must be at least 1 and --interval at least 10 seconds")
     return run_checks(parts, args.checks, args.interval, args.dry_run)

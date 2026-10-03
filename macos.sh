@@ -1,7 +1,7 @@
 #!/bin/bash
 # Run the Apple Store Hong Kong stock watch on this Mac with launchd: checks all
-# the time while the Mac is awake, pausing 1, 2 and 3 minutes in turn (a quiet status every 3 rounds),
-# also after a restart or login.
+# the time while the Mac is awake, pausing 1, 2 and 3 minutes in turn (a quiet status every 10 minutes),
+# also after a restart or login. Not together with the server: each would send its own alerts.
 #
 #   bash macos.sh install [minutes]   start (other pauses are optional, e.g. 5,3,4)
 #   bash macos.sh status              is it running, last checks

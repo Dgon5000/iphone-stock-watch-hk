@@ -24,7 +24,7 @@ from check_stock import HISTORY_FILE, HKT, color_emoji, describe
 MERGE_GAP = timedelta(minutes=5)
 SHOW_LAST = 8  # appearances listed per configuration
 JOURNAL_LINE = re.compile(
-    r"^\[(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d) HKT\] (?:Check \d+/\d+: )?(\d+) stores × \d+ models checked — (.*)$"
+    r"^\[(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d) HKT\] (?:(?:Check \d+/\d+|VPS|GitHub|Mac): )?(\d+) stores × \d+ models checked — (.*)$"
 )
 
 

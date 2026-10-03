@@ -1,26 +1,35 @@
 #!/bin/bash
 # Install the Apple Store Hong Kong stock watch on a Linux server with systemd
-# (Ubuntu, Debian and similar) as a service that checks all the time, pausing
-# 1, 2 and 3 minutes in turn (a quiet status every 3 rounds), plus a second service
-# that answers /iphone in Telegram.
-# Both start again after reboots or crashes.
+# (Ubuntu, Debian and similar) as a service that checks at :00 of every minute and sends a
+# quiet status every 10 minutes, plus a second service that answers /iphone and /report in
+# Telegram. GitHub may check at :30 and hand its checks in over SSH (see feed-key): one
+# state for both, so a check every 30 seconds and still one alert per change.
+# Both services start again after reboots or crashes.
 #
 #   sudo bash vps_install.sh             install or update (asks for the Telegram token on the first run)
-#   sudo SCHEDULE=5,3,4 STATUS_ROUNDS=1 bash vps_install.sh   other pauses (minutes, in turn) and status rounds (0 = none)
+#   sudo EVERY=60 OFFSET=0 STATUS_MINUTES=10 bash vps_install.sh   other check times (seconds) and status period (minutes, 0 = none)
+#   sudo bash vps_install.sh feed-key 'ssh-ed25519 AAAA… github'   let GitHub hand in its checks with this SSH key
 #   sudo bash vps_install.sh status      send what is in stock now to Telegram
 #   sudo bash vps_install.sh report      when which configuration was in stock (history report)
-#   sudo bash vps_install.sh uninstall   stop and remove the service (files and settings stay)
+#   sudo bash vps_install.sh uninstall   stop and remove the services and GitHub's access (files and settings stay)
 #
-# Logs: journalctl -u iphone-stock-watch-hk -f   (checks)
-#       journalctl -u iphone-stock-watch-hk-bot -f   (/iphone)
+# Logs: journalctl -u iphone-stock-watch-hk -f   (checks, GitHub's too)
+#       journalctl -u iphone-stock-watch-hk-bot -f   (/iphone, /report)
 set -euo pipefail
 
 APP="${APP:-/opt/iphone-stock-watch-hk}"
 UNIT_DIR="${UNIT_DIR:-/etc/systemd/system}"
-SCHEDULE="${SCHEDULE:-1,2,3}"
-STATUS_ROUNDS="${STATUS_ROUNDS:-3}"
+EVERY="${EVERY:-60}"
+OFFSET="${OFFSET:-0}"
+STATUS_MINUTES="${STATUS_MINUTES:-10}"
 NAME="iphone-stock-watch-hk"
 RUN_USER="stockwatch"
+# GitHub logs in as FEED_USER, whose key may only run check_stock.py --ingest (a root-owned
+# copy in FEED_LIB) to drop checks into INBOX, a folder only it and the watcher can use.
+FEED_USER="stockfeed"
+FEED_HOME="${FEED_HOME:-/var/lib/stockfeed}"
+FEED_LIB="${FEED_LIB:-/usr/local/lib/iphone-stock-watch-hk}"
+INBOX="${INBOX:-/var/spool/iphone-stock-watch-hk}"
 SRC="$(cd "$(dirname "$0")" && pwd)"
 
 if [ "$(id -u)" -ne 0 ]; then
@@ -36,33 +45,45 @@ remove_units() {
   systemctl daemon-reload
 }
 
-if [ "${1:-}" = "uninstall" ]; then
-  remove_units
-  echo "Службы удалены. Файлы и настройки остались в $APP."
-  exit 0
-fi
+FEED_KEY=""
+case "${1:-}" in
+  uninstall)
+    remove_units
+    rm -f "$FEED_HOME/.ssh/authorized_keys"
+    echo "Службы удалены, доступ GitHub по SSH закрыт. Файлы и настройки остались в $APP."
+    exit 0
+    ;;
+  report)
+    shift
+    exec python3 "$APP/stock_report.py" "$APP/stock_history.jsonl" "$@"
+    ;;
+  status)
+    (
+      while IFS='=' read -r key value; do
+        if [ -n "$key" ]; then export "$key=$value"; fi
+      done < "$APP/config.env"
+      python3 "$APP/check_stock.py" --status
+    )
+    exit $?
+    ;;
+  feed-key)
+    FEED_KEY="${2:-}"
+    key_re='^ssh-ed25519 [A-Za-z0-9+/]+={0,3}( [A-Za-z0-9@._:+-]+)?$'
+    if ! [[ "$FEED_KEY" =~ $key_re ]]; then
+      echo "Нужен открытый ключ ssh-ed25519 в кавычках: sudo bash $0 feed-key 'ssh-ed25519 AAAA… github'" >&2
+      exit 1
+    fi
+    ;;
+  "") ;;
+  *)
+    echo "Неизвестная команда: $1 (есть feed-key, status, report, uninstall)" >&2
+    exit 1
+    ;;
+esac
 
-if [ "${1:-}" = "report" ]; then
-  shift
-  exec python3 "$APP/stock_report.py" "$APP/stock_history.jsonl" "$@"
-fi
-
-if [ "${1:-}" = "status" ]; then
-  (
-    while IFS='=' read -r key value; do
-      if [ -n "$key" ]; then export "$key=$value"; fi
-    done < "$APP/config.env"
-    python3 "$APP/check_stock.py" --status
-  )
-  exit $?
-fi
-
-if ! [[ "$SCHEDULE" =~ ^[0-9]+(\.[0-9]+)?(,[0-9]+(\.[0-9]+)?)*$ ]]; then
-  echo "SCHEDULE — минуты через запятую, например 1,2,3." >&2
-  exit 1
-fi
-if ! [[ "$STATUS_ROUNDS" =~ ^[0-9]+$ ]]; then
-  echo "STATUS_ROUNDS — целое число кругов между сводками, 0 — без сводок." >&2
+if ! [[ "$EVERY" =~ ^[0-9]+$ && "$OFFSET" =~ ^[0-9]+$ && "$STATUS_MINUTES" =~ ^[0-9]+$ ]] \
+    || [ "$EVERY" -lt 10 ] || [ "$OFFSET" -ge "$EVERY" ]; then
+  echo "EVERY — секунды между проверками (не меньше 10), OFFSET — сдвиг в секундах (меньше EVERY), STATUS_MINUTES — минуты между сводками (0 — без сводок)." >&2
   exit 1
 fi
 
@@ -106,6 +127,21 @@ if [ ! -f "$APP/config.env" ]; then
   fi
 fi
 
+# GitHub's way in. Its home, key and program belong to root, so the key can do nothing but
+# hand in checks, even if it leaks.
+id "$FEED_USER" >/dev/null 2>&1 || useradd --system --user-group --home-dir "$FEED_HOME" --shell /bin/sh "$FEED_USER"
+install -d -m 755 -o root -g root "$FEED_HOME" "$FEED_HOME/.ssh" "$FEED_LIB"
+install -m 644 -o root -g root "$SRC/check_stock.py" "$FEED_LIB/check_stock.py"
+install -d -m 2770 -o "$FEED_USER" -g "$RUN_USER" "$INBOX"
+if [ -n "$FEED_KEY" ]; then
+  printf '%s\n' "$FEED_KEY" > "$FEED_HOME/.ssh/feed_key.pub"
+fi
+if [ -f "$FEED_HOME/.ssh/feed_key.pub" ]; then
+  printf 'restrict,command="%s -I %s/check_stock.py --ingest %s --source github" %s\n' \
+    "$PYTHON" "$FEED_LIB" "$INBOX" "$(head -n 1 "$FEED_HOME/.ssh/feed_key.pub")" > "$FEED_HOME/.ssh/authorized_keys"
+  chmod 644 "$FEED_HOME/.ssh/feed_key.pub" "$FEED_HOME/.ssh/authorized_keys"
+fi
+
 remove_units
 cat > "$UNIT_DIR/$NAME.service" <<EOF
 [Unit]
@@ -118,14 +154,14 @@ Type=simple
 User=$RUN_USER
 WorkingDirectory=$APP
 EnvironmentFile=$APP/config.env
-ExecStart=$PYTHON -u $APP/check_stock.py --watch $SCHEDULE --status-every $STATUS_ROUNDS
+ExecStart=$PYTHON -u $APP/check_stock.py --watch --every $EVERY --offset $OFFSET --status-minutes $STATUS_MINUTES --inbox $INBOX
 Restart=always
 RestartSec=30
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
-ReadWritePaths=$APP
+ReadWritePaths=$APP $INBOX
 
 [Install]
 WantedBy=multi-user.target
@@ -158,5 +194,10 @@ systemctl daemon-reload
 systemctl enable --now "$NAME.service" "$NAME-bot.service"
 sleep 5
 journalctl -u "$NAME.service" -u "$NAME-bot.service" -n 6 --no-pager -o cat || true
-echo "Готово: проверка идёт постоянно, паузы $SCHEDULE мин по кругу, сводка раз в $STATUS_ROUNDS круга; бот отвечает на /iphone. Всё запускается и после перезагрузки."
+echo "Готово: сервер проверяет каждые $EVERY с (сдвиг $OFFSET с), сводка раз в $STATUS_MINUTES мин; бот отвечает на /iphone и /report. Всё запускается и после перезагрузки."
+if [ -f "$FEED_HOME/.ssh/authorized_keys" ]; then
+  echo "GitHub может передавать свои проверки (ключ установлен)."
+else
+  echo "Чтобы GitHub передавал свои проверки: sudo bash $0 feed-key 'ssh-ed25519 AAAA… github'"
+fi
 echo "Логи: journalctl -u $NAME -f  и  journalctl -u $NAME-bot -f"
