@@ -493,7 +493,8 @@ class SyncCommand(FakeClockBase):
         return self.cs.sync(self.shared, io.BytesIO(raw), out), out.getvalue()
 
     def test_answers_with_the_status_and_keeps_what_the_standby_hands_back(self):
-        self.assertEqual(self.sync(b""), (0, '{"alive": "2026-10-03T02:00:00+00:00", "available": []}\n'))
+        # with "age", seconds since it worked by this server's clock (10:00:05 - 10:00:00)
+        self.assertEqual(self.sync(b""), (0, '{"alive": "2026-10-03T02:00:00+00:00", "available": [], "age": 5}\n'))
         self.assertEqual([p.name for p in self.shared.iterdir()], ["status.sync"])
         stock = [{"partNumber": U, "product": "iPhone 18 Pro Max 512GB Silver"}]
         self.assertEqual(self.sync(json.dumps({"available": stock}).encode())[0], 0)
@@ -525,6 +526,7 @@ class StandbyBase(FakeClockBase):
         self.inbox.mkdir()
         self.main_down = False
         self.main_alive = None  # None: now
+        self.main_age = None  # None: from main_alive
         self.main_stock = SILVER
         self.calls = []  # (time, what the standby sent)
         self.apple = lambda moment: {("R499", U)}
@@ -539,7 +541,9 @@ class StandbyBase(FakeClockBase):
         if self.main_down:
             return subprocess.CompletedProcess(args, 255, b"", b"ssh: connect to host 198.51.100.7 port 22: Connection timed out\n")
         alive = self.main_alive or datetime.fromtimestamp(self.clock.now, timezone.utc).isoformat()
-        return subprocess.CompletedProcess(args, 0, json.dumps({"alive": alive, "available": self.main_stock}).encode(), b"")
+        age = self.main_age if self.main_age is not None else int(self.clock.now - datetime.fromisoformat(alive).timestamp())
+        reply = {"alive": alive, "available": self.main_stock, "age": age}
+        return subprocess.CompletedProcess(args, 0, json.dumps(reply).encode(), b"")
 
     def github_check(self, stock, when):
         data = self.cs.check_to_json("github", self.result(stock, utc(when)))
@@ -595,6 +599,14 @@ class StandbyServer(StandbyBase):
         self.assertEqual(self.texts()[0], "⚠️ Основной сервер не работает уже 10 мин (служба проверки на нём остановлена). "
                                           "Проверку продолжает запасной сервер.")
         self.assertEqual(self.world.request_times, [hkt("10:01:00"), hkt("10:02:00")])
+
+    def test_the_main_servers_clock_does_not_matter(self):
+        # Its clock is an hour behind, but it says it worked 5 s ago: it works.
+        self.main_alive = datetime.fromtimestamp(self.clock.now - 3600, timezone.utc).isoformat()
+        self.main_age = 5
+        self.run_until(hkt("10:06:10"))
+        self.assertEqual(self.world.apple_requests, [])
+        self.assertEqual(self.world.sent(), [])
 
     def test_short_trouble_with_the_main_server_is_not_a_reason(self):
         def trouble(now):  # two short outages, five minutes apart
@@ -813,7 +825,9 @@ class Installer(unittest.TestCase):
         (self.inbox / "status.sync").write_text('{"alive": "2026-10-03T02:00:00+00:00"}')
         done = subprocess.run(command, input='{"available": []}', capture_output=True, text=True, env=self.env, timeout=30)
         self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertEqual(json.loads(done.stdout), {"alive": "2026-10-03T02:00:00+00:00"})
+        status = json.loads(done.stdout)
+        self.assertEqual(status["alive"], "2026-10-03T02:00:00+00:00")
+        self.assertIsInstance(status["age"], int)
         self.assertEqual(json.loads((self.inbox / "handback.sync").read_text()), {"available": []})
 
     def test_bad_standby_settings_are_refused(self):

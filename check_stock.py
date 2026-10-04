@@ -1118,7 +1118,11 @@ class Standby(Watcher):
         payload = {"available": self.state.get("available") or []} if self.active else {}
         reply, problem = exchange(self.main, payload)
         now = utc_now()
-        alive = parse_utc(reply.get("alive")) if reply else None
+        age = reply.get("age") if reply else None
+        if isinstance(age, int) and not isinstance(age, bool):  # seconds since it last worked, by its clock
+            alive = now - timedelta(seconds=max(0, age))
+        else:
+            alive = parse_utc(reply.get("alive")) if reply else None
         if reply is not None and not self.dry_run:
             self.state["main_seen_utc"] = now.isoformat(timespec="seconds")
         if alive and now - alive < MAIN_SILENT_AFTER:
@@ -1399,7 +1403,11 @@ def sync(shared, stream, out):
             write_shared(shared / HANDBACK_SYNC, {"available": stock_from_json(data["available"])})
         if "history" in data:
             write_shared(shared / f"history-{time.time_ns()}.sync", history_from_json(data["history"]))
-        out.write(json.dumps(read_shared(shared / STATUS_SYNC), ensure_ascii=False) + "\n")
+        status = read_shared(shared / STATUS_SYNC)
+        alive = parse_utc(status.get("alive"))
+        if alive:  # by this server's clock, so that the two servers' clocks need not agree
+            status["age"] = max(0, int((utc_now() - alive).total_seconds()))
+        out.write(json.dumps(status, ensure_ascii=False) + "\n")
         out.flush()
     except (OSError, ValueError) as exc:
         print(f"ERROR: sync failed: {exc}", file=sys.stderr, flush=True)
