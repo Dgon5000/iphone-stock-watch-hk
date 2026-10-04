@@ -35,6 +35,7 @@ jobs:
         env:
           FEED_SSH_KEY: ${{ secrets.FEED_SSH_KEY }}
           FEED_HOST: ${{ secrets.FEED_HOST }}
+          FEED_HOST_BACKUP: ${{ secrets.FEED_HOST_BACKUP }}
           FEED_KNOWN_HOSTS: ${{ secrets.FEED_KNOWN_HOSTS }}
         shell: bash
         run: |
@@ -60,12 +61,19 @@ jobs:
             ControlPath ~/.ssh/feed-%C
             ControlPersist 10m
           EOF
+          # The standby server (FEED_KNOWN_HOSTS then lists both servers' keys) takes the
+          # checks the main one does not.
+          if [ -n "$FEED_HOST_BACKUP" ]; then
+            sed -e '1s/^Host feed$/Host feed2/' -e "2s/HostName .*/HostName $FEED_HOST_BACKUP/" ~/.ssh/config > ~/.ssh/feed2
+            cat ~/.ssh/feed2 >> ~/.ssh/config && rm ~/.ssh/feed2
+          fi
 
       - name: Check Apple at :30 of every minute and hand each check to the server
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           PART_NUMBERS: ${{ vars.PART_NUMBERS }}
+          FEED_HOST_BACKUP: ${{ secrets.FEED_HOST_BACKUP }}
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
@@ -74,7 +82,9 @@ jobs:
           # cannot loop. Detached from this step's output, which GitHub would wait for.
           ( sleep 600 && gh workflow run stock-watch.yml --ref "$GITHUB_REF_NAME" && echo "The next run is lined up." ) \
             > "$RUNNER_TEMP/line-up.log" 2>&1 < /dev/null &
-          python3 -u check_stock.py --probe feed --every 60 --offset 30 --minutes 330
+          backup=()
+          if [ -n "$FEED_HOST_BACKUP" ]; then backup=(--backup feed2); fi
+          python3 -u check_stock.py --probe feed "${backup[@]}" --every 60 --offset 30 --minutes 330
 
       - name: Start the next run unless it is lined up
         env:

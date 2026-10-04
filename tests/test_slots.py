@@ -71,7 +71,7 @@ class FakeClockBase(Base):
         return [json.loads(line) for line in f.read_text().splitlines()] if f.exists() else []
 
 
-class Shared(FakeClockBase):
+class SharedBase(FakeClockBase):
     """run_slots on the fake clock: the server checks the fake Apple at :00 of every minute;
     GitHub's check of every :30 arrives in the inbox through ingest() a second later."""
 
@@ -110,6 +110,8 @@ class Shared(FakeClockBase):
         with self.assertRaises(Stop):
             self.cs.run_slots(list(PRO_MAX), 60, 0, False, status_minutes, self.inbox, "vps")
 
+
+class Shared(SharedBase):
     def test_checks_alternate_and_each_change_is_reported_once(self):
         def stock(moment):  # 512GB Silver at Canton Road from 10:02:30 until 10:05
             return {("R499", U)} if hkt("10:02:30") <= moment < hkt("10:05:00") else set()
@@ -129,7 +131,7 @@ class Shared(FakeClockBase):
         self.assertEqual(checks[0]["time"], "2026-10-03T10:00:30+08:00")
         self.assertEqual(checks[1]["time"], "2026-10-03T10:01:00+08:00")
         self.assertEqual(checks[4]["in_stock"], {"iPhone 18 Pro Max 512GB Silver": ["Canton Road"]})
-        self.assertEqual(list(self.inbox.iterdir()), [])
+        self.assertEqual(list(self.inbox.glob("*.json")), [])
         self.assertIn("GitHub: 6 stores × 12 models checked — iPhone 18 Pro Max 512GB Silver: Canton Road", sys.stdout.getvalue())
         self.assertEqual(self.state()["sources"], ["github", "vps"])
 
@@ -230,7 +232,7 @@ class Shared(FakeClockBase):
         checks = [line for line in self.history() if "in_stock" in line]
         self.assertEqual([(c["time"][11:19], c["source"]) for c in checks],
                          [("10:01:00", "vps"), ("10:00:20", "github"), ("10:01:02", "github")])
-        self.assertEqual(list(self.inbox.iterdir()), [])
+        self.assertEqual(list(self.inbox.glob("*.json")), [])
         self.assertIn("GitHub: older than the last check; it went into the history only.", sys.stdout.getvalue())
         self.assertIn("ERROR: GitHub checks other part numbers; its check went into the history only.", self.stderr())
         self.assertIn("its time is in the future", self.stderr())
@@ -310,7 +312,7 @@ class Ingest(FakeClockBase):
                 self.cs.check_from_json(broken)
 
 
-class Probe(FakeClockBase):
+class ProbeBase(FakeClockBase):
     def setUp(self):
         super().setUp()
         self.delivered = []
@@ -325,6 +327,8 @@ class Probe(FakeClockBase):
         with mock.patch.object(self.cs.subprocess, "run", self.fake_run):
             return self.cs.run_probe(list(PRO_MAX), "feed", 60, 30, minutes)
 
+
+class Probe(ProbeBase):
     def test_checks_at_30_seconds_past_and_hands_every_check_in(self):
         self.world.stock = {("R428", B)}
         self.assertEqual(self.probe(minutes=3), 0)
@@ -388,12 +392,12 @@ class Cli(Base):
         parts = list(self.cs.DEFAULT_PART_NUMBERS)
         with mock.patch.object(self.cs, "run_slots", return_value=0) as run:
             self.main("--watch", "--every", "60", "--inbox", "/var/spool/x")
-        run.assert_called_once_with(parts, 60, 0, False, 10, "/var/spool/x", "vps")
+        run.assert_called_once_with(parts, 60, 0, False, 10, "/var/spool/x", "vps", None)
         self.assertIn("a check every 60 s, 0 s past the clock plus the checks handed in through /var/spool/x; a quiet status every 10 min.",
                       sys.stdout.getvalue())
         with mock.patch.object(self.cs, "run_probe", return_value=0) as run:
             self.main("--probe", "feed", "--every", "60", "--offset", "30", "--minutes", "330")
-        run.assert_called_once_with(parts, "feed", 60, 30, 330, "github")
+        run.assert_called_once_with(parts, "feed", 60, 30, 330, "github", None)
         with mock.patch.object(self.cs, "ingest", return_value=0) as run:
             self.main("--ingest", "/var/spool/x", "--source", "github")
         self.assertEqual(run.call_args.args[:2], ("/var/spool/x", "github"))
@@ -402,6 +406,261 @@ class Cli(Base):
         for args in (["--watch", "--every", "5"], ["--watch", "--every", "60", "--offset", "60"],
                      ["--inbox", "/x"], ["--every", "60"], ["--probe", "feed"],
                      ["--probe", "feed", "--every", "60", "--minutes", "-1"]):
+            with self.subTest(args=args), self.assertRaises(SystemExit):
+                self.main(*args)
+
+
+SILVER = [{"partNumber": U, "product": "iPhone 18 Pro Max 512GB Silver"}]
+
+
+class MainServer(SharedBase):
+    """The main server's side of a standby: it says how it is in status.sync, takes back what
+    the standby did, and after a break waits for it before reporting changes."""
+
+    def back_after_a_break(self, minutes=10):
+        alive = datetime.fromtimestamp(self.clock.now - minutes * 60, timezone.utc).isoformat()
+        (self.inbox / "status.sync").write_text(json.dumps({"alive": alive}))
+
+    def test_status_file_says_it_works_and_what_is_in_stock(self):
+        self.vps = self.github = lambda moment: {("R499", U)}
+        self.run_until(hkt("10:02:10"))
+        status = json.loads((self.inbox / "status.sync").read_text())
+        self.assertEqual(status, {"alive": "2026-10-03T02:02:00+00:00", "checked": "2026-10-03T02:02:00+00:00",
+                                  "available": SILVER})
+        self.assertEqual((self.inbox / "status.sync").stat().st_mode & 0o777, 0o644)  # the --sync user reads it
+
+    def test_back_after_a_break_it_waits_two_minutes_then_reports(self):
+        self.back_after_a_break()
+        self.vps = self.github = lambda moment: {("R499", U)}
+        self.run_until(hkt("10:03:10"))
+        [alert] = self.texts()
+        self.assertIn("🟢 Появились", alert)
+        self.assertIn("🕐 Проверено: 03.10.2026 10:02 (HKT)", alert)  # GitHub's 10:02:30, after the wait
+        self.assertIn("Back after 10 min away", sys.stdout.getvalue())
+        self.assertIn("Reporting changes again.", sys.stdout.getvalue())
+
+    def test_the_standbys_stock_and_checks_are_taken_back_without_alerts(self):
+        self.back_after_a_break()
+        self.vps = self.github = lambda moment: {("R499", U)}
+        checks = [{"time": "2026-10-03T09:55:00+08:00", "source": "backup", "stores": 6,
+                   "in_stock": {"iPhone 18 Pro Max 512GB Silver": ["Canton Road"]}}]
+
+        def standby(now):  # its syncs at :45: the stock while standing in, then its checks
+            if now == hkt("10:00:45"):
+                out = io.StringIO()
+                self.assertEqual(self.cs.sync(self.inbox, io.BytesIO(json.dumps({"available": SILVER}).encode()), out), 0)
+                self.assertIn("alive", json.loads(out.getvalue()))
+            if now == hkt("10:01:45"):
+                self.assertEqual(self.cs.sync(self.inbox, io.BytesIO(json.dumps({"history": checks}).encode()), io.StringIO()), 0)
+
+        self.clock.hooks.append(standby)
+        self.run_until(hkt("10:05:10"))
+        self.assertEqual(self.world.sent(), [])  # the standby had reported 512GB Silver already
+        self.assertEqual(self.state()["available"], SILVER)
+        self.assertIn(checks[0], self.history())
+        self.assertEqual(list(self.inbox.glob("*.sync")), [self.inbox / "status.sync"])
+        out = sys.stdout.getvalue()
+        self.assertIn("The standby handed back: 1 configuration(s) in stock", out)
+        self.assertIn("Added the standby's 1 check(s) to the history.", out)
+
+    def test_a_change_soon_after_the_hand_back_is_left_to_the_standby_then_reported_once(self):
+        # 2TB Black comes at 10:01:30, while the standby may still be standing in (it stands
+        # aside at its next sync): this server reports it only after 75 s of quiet.
+        self.back_after_a_break()
+        self.vps = self.github = lambda moment: {("R499", U)} | ({("R409", B)} if moment >= hkt("10:01:30") else set())
+
+        def standby(now):
+            if now == hkt("10:00:45"):
+                self.cs.sync(self.inbox, io.BytesIO(json.dumps({"available": SILVER}).encode()), io.StringIO())
+
+        self.clock.hooks.append(standby)
+        self.run_until(hkt("10:04:10"))
+        [alert] = self.texts()
+        self.assertIn("🖤 2TB · Black", alert)
+        self.assertNotIn("512GB", alert)
+        self.assertIn("🕐 Проверено: 03.10.2026 10:02 (HKT)", alert)  # GitHub's 10:02:30, after the quiet
+
+
+class SyncCommand(FakeClockBase):
+    def setUp(self):
+        super().setUp()
+        self.shared = self.tmp / "inbox"
+        self.shared.mkdir()
+        (self.shared / "status.sync").write_text('{"alive": "2026-10-03T02:00:00+00:00", "available": []}')
+
+    def sync(self, raw):
+        out = io.StringIO()
+        return self.cs.sync(self.shared, io.BytesIO(raw), out), out.getvalue()
+
+    def test_answers_with_the_status_and_keeps_what_the_standby_hands_back(self):
+        self.assertEqual(self.sync(b""), (0, '{"alive": "2026-10-03T02:00:00+00:00", "available": []}\n'))
+        self.assertEqual([p.name for p in self.shared.iterdir()], ["status.sync"])
+        stock = [{"partNumber": U, "product": "iPhone 18 Pro Max 512GB Silver"}]
+        self.assertEqual(self.sync(json.dumps({"available": stock}).encode())[0], 0)
+        handback = self.shared / "handback.sync"
+        self.assertEqual(json.loads(handback.read_text()), {"available": SILVER})
+        self.assertEqual(handback.stat().st_mode & 0o777, 0o640)  # for the watcher's group
+        lines = [{"time": "2026-10-03T10:00:00+08:00", "source": "backup", "error": "Apple returned HTTP 541"}]
+        self.assertEqual(self.sync(json.dumps({"history": lines}).encode())[0], 0)
+        [saved] = self.shared.glob("history-*.sync")
+        self.assertEqual(json.loads(saved.read_text()), lines)
+
+    def test_refuses_what_is_not_right(self):
+        with mock.patch.object(self.cs, "MAX_SYNC_BYTES", 200):
+            for raw in (b"[1]", b"{not json", json.dumps({"available": "x"}).encode(),
+                        json.dumps({"history": [{"time": "no"}]}).encode(), b"{" + b" " * 300 + b"}"):
+                with self.subTest(raw=raw[:30]):
+                    self.assertEqual(self.sync(raw)[0], 1)
+        self.assertEqual(self.stderr().count("ERROR: sync failed:"), 5)
+        self.assertEqual([p.name for p in self.shared.iterdir()], ["status.sync"])
+
+
+class StandbyBase(FakeClockBase):
+    """run_slots as a standby (--standby-of main) on the fake clock. The main server's --sync
+    is a fake that answers with main_status(), or fails while main_down."""
+
+    def setUp(self):
+        super().setUp()
+        self.inbox = self.tmp / "inbox"
+        self.inbox.mkdir()
+        self.main_down = False
+        self.main_alive = None  # None: now
+        self.main_stock = SILVER
+        self.calls = []  # (time, what the standby sent)
+        self.apple = lambda moment: {("R499", U)}
+        self.world.stock_fn = lambda: self.apple(self.clock.now)
+        patch = mock.patch.object(self.cs.subprocess, "run", self.fake_ssh)
+        patch.start()
+        self.patches.append(patch)
+
+    def fake_ssh(self, args, input=None, capture_output=None, timeout=None):
+        self.assertEqual(args, ["ssh", "-T", "main"])
+        self.calls.append((self.clock.now, json.loads(input or b"{}")))
+        if self.main_down:
+            return subprocess.CompletedProcess(args, 255, b"", b"ssh: connect to host 198.51.100.7 port 22: Connection timed out\n")
+        alive = self.main_alive or datetime.fromtimestamp(self.clock.now, timezone.utc).isoformat()
+        return subprocess.CompletedProcess(args, 0, json.dumps({"alive": alive, "available": self.main_stock}).encode(), b"")
+
+    def github_check(self, stock, when):
+        data = self.cs.check_to_json("github", self.result(stock, utc(when)))
+        self.assertEqual(self.ingest(self.inbox, "github", io.BytesIO(json.dumps(data).encode() + b"\n")), 0)
+
+    def run_until(self, until, *hooks):
+        def stop(now):
+            if now >= until:
+                raise Stop()
+
+        self.clock.hooks[:] = [*hooks, stop]
+        with self.assertRaises(Stop):
+            self.cs.run_slots(list(PRO_MAX), 60, 0, False, 10, self.inbox, "backup", "main")
+
+
+class StandbyServer(StandbyBase):
+    def test_while_the_main_server_works_it_only_asks_how_it_is(self):
+        self.main_stock = SILVER + [{"partNumber": B, "product": "iPhone 18 Pro Max 2TB Black"}]
+        self.run_until(hkt("10:05:10"), lambda now: self.github_check({("R499", U)}, "10:01:30") if now == hkt("10:01:31") else None)
+        self.assertEqual(self.world.apple_requests, [])
+        self.assertEqual(self.world.sent(), [])
+        self.assertEqual([t for t, _ in self.calls], [hkt(f"10:0{m}:45") for m in range(5)])
+        self.assertEqual({json.dumps(p) for _, p in self.calls}, {"{}"})
+        self.assertEqual(self.state()["available"], self.main_stock)  # ready to stand in
+        self.assertEqual(list(self.inbox.glob("*.json")), [])  # GitHub's check was the main server's business
+
+    def test_stands_in_and_hands_back(self):
+        def world(now):
+            self.main_down = hkt("10:02:00") <= now < hkt("10:09:00")
+            if now == hkt("10:06:31"):
+                self.github_check({("R499", U)}, "10:06:30")
+
+        self.apple = lambda moment: {("R499", U)} | ({("R409", B)} if moment >= hkt("10:07:00") else set())
+        self.run_until(hkt("10:12:10"), world)
+        texts = self.texts()
+        self.assertEqual(texts[0], "⚠️ Основной сервер не работает уже 3 мин (нет связи). Проверку продолжает запасной сервер.")
+        self.assertIn("🟢 Появились · iPhone 18 Pro Max\n🖤 2TB · Black", texts[1])  # 512GB Silver was known: no alert
+        self.assertEqual(texts[2], "✅ Основной сервер снова проверяет. Запасной вернулся в режим ожидания.")
+        self.assertEqual(len(texts), 3)
+        self.assertEqual(self.world.request_times, [hkt(f"10:{m:02d}:00") for m in range(6, 10)])  # 10:05:45 → 10:09:45
+        back = [(t, p) for t, p in self.calls if p]
+        self.assertEqual(back[-2][0], hkt("10:09:45"))
+        self.assertEqual({i["partNumber"] for i in back[-2][1]["available"]}, {U, B})  # the stock for the main server
+        history = back[-1][1]["history"]
+        self.assertEqual([(line["time"][11:19], line["source"]) for line in history],
+                         [("10:06:00", "backup"), ("10:06:30", "github"), ("10:07:00", "backup"),
+                          ("10:08:00", "backup"), ("10:09:00", "backup")])
+        self.assertEqual([p for t, p in self.calls if t > hkt("10:09:45")], [{}, {}])  # standing by again
+
+    def test_stands_in_at_once_when_the_main_server_stopped_checking_long_ago(self):
+        self.main_alive = datetime.fromtimestamp(self.clock.now - 600, timezone.utc).isoformat()
+        self.run_until(hkt("10:02:10"))
+        self.assertEqual(self.texts()[0], "⚠️ Основной сервер не работает уже 10 мин (служба проверки на нём остановлена). "
+                                          "Проверку продолжает запасной сервер.")
+        self.assertEqual(self.world.request_times, [hkt("10:01:00"), hkt("10:02:00")])
+
+    def test_short_trouble_with_the_main_server_is_not_a_reason(self):
+        def trouble(now):  # two short outages, five minutes apart
+            self.main_down = hkt("10:02:00") <= now < hkt("10:04:00") or hkt("10:07:00") <= now < hkt("10:08:00")
+
+        self.run_until(hkt("10:09:10"), trouble)
+        self.assertEqual(self.world.apple_requests, [])
+        self.assertEqual(self.world.sent(), [])
+
+
+class StandbyFirstContact(StandbyBase):
+    def test_never_stands_in_for_a_server_it_never_reached(self):
+        self.main_down = True  # e.g. its key is not on the main server yet
+        self.run_until(hkt("10:10:10"))
+        self.assertEqual(self.world.apple_requests, [])
+        self.assertEqual(self.world.sent(), [])
+        self.assertIn("not standing in for a server never seen working", self.stderr())
+
+    def test_after_a_restart_it_remembers_the_main_server_worked(self):
+        (self.tmp / "stock_state.json").write_text(json.dumps({"main_seen_utc": "2026-10-03T01:00:00+00:00", "available": SILVER}))
+        self.main_down = True
+        self.run_until(hkt("10:05:10"))
+        self.assertTrue(self.texts()[0].startswith("⚠️ Основной сервер не работает уже 3 мин (нет связи)."))
+        self.assertEqual(self.world.request_times, [hkt("10:04:00"), hkt("10:05:00")])
+
+
+class ProbeWithStandby(ProbeBase):
+    def test_a_check_the_server_does_not_take_goes_to_the_standby(self):
+        def run(args, input=None, capture_output=None, timeout=None):
+            self.delivered.append((args[-1], self.clock.now))
+            refused = args[-1] == "feed" or self.both_down
+            return subprocess.CompletedProcess(args, 255 if refused else 0, b"", b"ssh: connect to host 203.0.113.9 port 22: Connection refused\n" if refused else b"")
+
+        self.both_down = False
+        with mock.patch.object(self.cs.subprocess, "run", run):
+            self.cs.run_probe(list(PRO_MAX), "feed", 60, 30, 35, "github", "feed2")
+        self.assertEqual([host for host, _ in self.delivered[:4]], ["feed", "feed2", "feed", "feed2"])
+        self.assertEqual(self.world.sent(), [])  # the standby took every check
+        self.assertIn("The server did not take the check (ssh: connect to host 203.0.113.9 port 22: Connection refused); the standby did.",
+                      sys.stdout.getvalue())
+        self.both_down = True
+        with mock.patch.object(self.cs.subprocess, "run", run):
+            self.cs.run_probe(list(PRO_MAX), "feed", 60, 30, 35, "github", "feed2")
+        [warning] = self.world.sent()
+        self.assertIn("не может передать проверки на сервер уже 30 мин", warning["text"])
+        self.assertIn("; standby: ssh: connect to host", warning["text"])
+
+
+class CliStandby(Base):
+    def main(self, *args):
+        with mock.patch.object(sys, "argv", ["check_stock.py", *args]):
+            return self.cs.main()
+
+    def test_standby_sync_and_backup(self):
+        parts = list(self.cs.DEFAULT_PART_NUMBERS)
+        with mock.patch.object(self.cs, "run_slots", return_value=0) as run:
+            self.main("--watch", "--every", "60", "--inbox", "/var/spool/x", "--standby-of", "main")
+        run.assert_called_once_with(parts, 60, 0, False, 10, "/var/spool/x", "backup", "main")
+        self.assertIn("Standing by for the main server (ssh main)", sys.stdout.getvalue())
+        with mock.patch.object(self.cs, "sync", return_value=0) as run:
+            self.main("--sync", "/var/spool/x")
+        self.assertEqual(run.call_args.args[0], "/var/spool/x")
+        with mock.patch.object(self.cs, "run_probe", return_value=0) as run:
+            self.main("--probe", "feed", "--backup", "feed2", "--every", "60", "--offset", "30")
+        run.assert_called_once_with(parts, "feed", 60, 30, 0, "github", "feed2")
+        for args in (["--watch", "--standby-of", "main"], ["--backup", "feed2"], ["--standby-of", "main"]):
             with self.subTest(args=args), self.assertRaises(SystemExit):
                 self.main(*args)
 
@@ -422,6 +681,8 @@ class Installer(unittest.TestCase):
             "systemctl": 'echo "systemctl $*" >> "$SIM/calls.log"',
             "journalctl": 'echo "journalctl $*" >> "$SIM/calls.log"',
             "sleep": 'echo "sleep $*" >> "$SIM/calls.log"',
+            "runuser": 'echo "runuser $*" >> "$SIM/calls.log"\nwhile [ "$#" -gt 0 ] && [ "$1" != "--" ]; do shift; done\nshift\nexec "$@"',
+            "ssh": 'echo "ssh $*" >> "$SIM/calls.log"\nexit 255',
         }
         (self.tmp / "bin").mkdir()
         for name, text in fakes.items():
@@ -495,13 +756,80 @@ class Installer(unittest.TestCase):
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertIsNone(self.keys())
         self.assertEqual(list(self.units.iterdir()), [])
-        self.assertIn("доступ GitHub по SSH закрыт", done.stdout)
+        self.assertIn("доступ по SSH для GitHub и запасного сервера закрыт", done.stdout)
 
     def test_without_a_key_github_is_explained(self):
         done = self.install()
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertIsNone(self.keys())
         self.assertIn("Чтобы GitHub передавал свои проверки", done.stdout)
+
+    MAIN_KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIC5tYWluc2VydmVyaG9zdGtleWZvcnRlc3RzMDAw"
+
+    def test_standby_role(self):
+        self.install("feed-key", self.KEY)
+        done = self.install("standby", "198.51.100.7", MAIN_HOST_KEY=self.MAIN_KEY)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        unit = (self.units / "iphone-stock-watch-hk.service").read_text()
+        self.assertIn(f"--inbox {self.inbox} --source backup --standby-of main\n", unit)
+        self.assertFalse((self.units / "iphone-stock-watch-hk-bot.service").exists())  # the bot stays on the main server
+        self.assertEqual((self.lib / "role").read_text(), "standby 198.51.100.7\n")
+        ssh = self.app / ".ssh"
+        config = (ssh / "config").read_text()
+        for line in ("Host main", "HostName 198.51.100.7", "User stockfeed", f"IdentityFile {ssh}/sync_key",
+                     "StrictHostKeyChecking yes", "BatchMode yes"):
+            self.assertIn(f"{line}\n", config)
+        self.assertEqual((ssh / "known_hosts").read_text(), f"198.51.100.7 {self.MAIN_KEY}\n")
+        self.assertEqual((ssh / "sync_key").stat().st_mode & 0o777, 0o600)
+        pub = (ssh / "sync_key.pub").read_text().strip()
+        self.assertIn(f"sudo bash vps_install.sh sync-key '{pub}'", done.stdout)
+        self.assertIn("Основной сервер пока не отвечает этому", done.stdout)  # its key is not on the main server yet
+        self.assertIn(f"runuser -u stockwatch -- ssh -F {ssh}/config -T main", (self.tmp / "calls.log").read_text())
+        self.assertIn("--source github", self.keys())  # GitHub may hand its checks to the standby too
+        again = self.install()  # an update keeps the role and the key
+        self.assertEqual(again.returncode, 0, again.stderr)
+        self.assertIn("--standby-of main", (self.units / "iphone-stock-watch-hk.service").read_text())
+        self.assertEqual((ssh / "sync_key.pub").read_text().strip(), pub)
+        refused = self.install("sync-key", self.KEY.replace("github-feed", "standby"))
+        self.assertEqual(refused.returncode, 1)
+        self.assertIn("sync-key ставится на основной", refused.stderr)
+
+    def test_the_main_server_lets_the_standby_ask(self):
+        self.install("feed-key", self.KEY)
+        standby_key = self.KEY.replace("github-feed", "standby-vps2")
+        done = self.install("sync-key", standby_key)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(self.keys().splitlines(), [
+            f'restrict,command="{self.python} -I {self.lib}/check_stock.py --ingest {self.inbox} --source github" {self.KEY}',
+            f'restrict,command="{self.python} -I {self.lib}/check_stock.py --sync {self.inbox}" {standby_key}',
+        ])
+        self.assertIn("Запасной сервер может узнавать, работает ли этот (ключ установлен).", done.stdout)
+        self.assertTrue((self.units / "iphone-stock-watch-hk-bot.service").exists())
+
+    def test_the_sync_command_answers(self):
+        self.install("feed-key", self.KEY)
+        self.install("sync-key", self.KEY.replace("github-feed", "standby"))
+        command = self.keys().splitlines()[1].split('command="')[1].split('"')[0].split()
+        (self.inbox / "status.sync").write_text('{"alive": "2026-10-03T02:00:00+00:00"}')
+        done = subprocess.run(command, input='{"available": []}', capture_output=True, text=True, env=self.env, timeout=30)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(json.loads(done.stdout), {"alive": "2026-10-03T02:00:00+00:00"})
+        self.assertEqual(json.loads((self.inbox / "handback.sync").read_text()), {"available": []})
+
+    def test_bad_standby_settings_are_refused(self):
+        for args, env in ((["standby"], {}), (["standby", "1.2.3.4; rm -rf /"], {}),
+                          (["standby", "198.51.100.7"], {"MAIN_HOST_KEY": "ssh-rsa AAAA"}),
+                          (["sync-key", "ssh-rsa AAAAB3 x"], {})):
+            with self.subTest(args=args):
+                done = self.install(*args, **env)
+                self.assertEqual(done.returncode, 1)
+        self.assertFalse((self.lib / "role").exists())
+
+    def test_report_runs_as_the_service_user(self):
+        self.assertEqual(self.install().returncode, 0)
+        done = self.install("report")
+        self.assertIn("В журнале пока нет проверок.", done.stderr)
+        self.assertIn("runuser -u stockwatch -- python3", (self.tmp / "calls.log").read_text())
 
     def test_bad_settings_and_commands_are_refused(self):
         for env in ({"EVERY": "5"}, {"OFFSET": "60"}, {"STATUS_MINUTES": "x"}, {"EVERY": "1m"}):

@@ -240,7 +240,10 @@ def main():
         for entry in import_journal(sys.stdin):
             print(json.dumps(entry, ensure_ascii=False))
         return 0
-    watched, checks = load(args.files or [HISTORY_FILE])
+    try:
+        watched, checks = load(args.files or [HISTORY_FILE])
+    except FileNotFoundError:
+        watched, checks = [], []
     if not checks:
         sys.exit("В журнале пока нет проверок.")
     print(report(watched, checks))

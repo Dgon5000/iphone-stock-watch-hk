@@ -4,14 +4,18 @@
 # quiet status every 10 minutes, plus a second service that answers /iphone and /report in
 # Telegram. GitHub may check at :30 and hand its checks in over SSH (see feed-key): one
 # state for both, so a check every 30 seconds and still one alert per change.
-# Both services start again after reboots or crashes.
+# A second server can stand by (see standby): it checks only while this one does not work.
+# The services start again after reboots or crashes.
 #
 #   sudo bash vps_install.sh             install or update (asks for the Telegram token on the first run)
 #   sudo EVERY=60 OFFSET=0 STATUS_MINUTES=10 bash vps_install.sh   other check times (seconds) and status period (minutes, 0 = none)
 #   sudo bash vps_install.sh feed-key 'ssh-ed25519 AAAA… github'   let GitHub hand in its checks with this SSH key
+#   sudo bash vps_install.sh standby MAIN_IP    make this server the standby of the main one (prints its key);
+#                                               MAIN_HOST_KEY='ssh-ed25519 AAAA…' gives the main server's host key
+#   sudo bash vps_install.sh sync-key 'ssh-ed25519 AAAA… standby'  on the main server: let the standby ask how it is
 #   sudo bash vps_install.sh status      send what is in stock now to Telegram
 #   sudo bash vps_install.sh report      when which configuration was in stock (history report)
-#   sudo bash vps_install.sh uninstall   stop and remove the services and GitHub's access (files and settings stay)
+#   sudo bash vps_install.sh uninstall   stop and remove the services and the SSH access (files and settings stay)
 #
 # Logs: journalctl -u iphone-stock-watch-hk -f   (checks, GitHub's too)
 #       journalctl -u iphone-stock-watch-hk-bot -f   (/iphone, /report)
@@ -24,13 +28,17 @@ OFFSET="${OFFSET:-0}"
 STATUS_MINUTES="${STATUS_MINUTES:-10}"
 NAME="iphone-stock-watch-hk"
 RUN_USER="stockwatch"
-# GitHub logs in as FEED_USER, whose key may only run check_stock.py --ingest (a root-owned
-# copy in FEED_LIB) to drop checks into INBOX, a folder only it and the watcher can use.
+# GitHub (and a standby server) log in as FEED_USER, whose keys may only run check_stock.py
+# --ingest or --sync (a root-owned copy in FEED_LIB) with INBOX, a folder only it and the
+# watcher can use.
 FEED_USER="stockfeed"
 FEED_HOME="${FEED_HOME:-/var/lib/stockfeed}"
 FEED_LIB="${FEED_LIB:-/usr/local/lib/iphone-stock-watch-hk}"
 INBOX="${INBOX:-/var/spool/iphone-stock-watch-hk}"
+ROLE_FILE="$FEED_LIB/role"  # "standby MAIN_HOST" on a standby server; root's, unlike $APP
 SRC="$(cd "$(dirname "$0")" && pwd)"
+KEY_RE='^ssh-ed25519 [A-Za-z0-9+/]+={0,3}( [A-Za-z0-9@._:+-]+)?$'
+HOST_RE='^[A-Za-z0-9.:-]+$'
 
 if [ "$(id -u)" -ne 0 ]; then
   echo "Запустите через sudo: sudo bash $0" >&2
@@ -45,38 +53,81 @@ remove_units() {
   systemctl daemon-reload
 }
 
+# Python runs as the service user, never as root: it can change the files in $APP. Only the
+# known settings come from config.env.
+as_service_user() {
+  (
+    while IFS='=' read -r key value; do
+      case "$key" in
+        TELEGRAM_BOT_TOKEN|TELEGRAM_CHAT_ID|PART_NUMBERS) export "$key=$value" ;;
+      esac
+    done < "$APP/config.env"
+    cd "$APP"
+    runuser -u "$RUN_USER" -- "$@"
+  )
+}
+
+ROLE="main"
+MAIN_HOST=""
+if [ -f "$ROLE_FILE" ]; then
+  read -r ROLE MAIN_HOST < "$ROLE_FILE" || true
+  if [ "$ROLE" != standby ] || ! [[ "$MAIN_HOST" =~ $HOST_RE ]]; then
+    echo "Непонятная роль в $ROLE_FILE; удалите файл или запустите: sudo bash $0 standby MAIN_IP" >&2
+    exit 1
+  fi
+fi
+
 FEED_KEY=""
+SYNC_KEY=""
 case "${1:-}" in
   uninstall)
     remove_units
     rm -f "$FEED_HOME/.ssh/authorized_keys"
-    echo "Службы удалены, доступ GitHub по SSH закрыт. Файлы и настройки остались в $APP."
+    echo "Службы удалены, доступ по SSH для GitHub и запасного сервера закрыт. Файлы и настройки остались в $APP."
     exit 0
     ;;
   report)
     shift
-    exec python3 "$APP/stock_report.py" "$APP/stock_history.jsonl" "$@"
+    as_service_user python3 "$APP/stock_report.py" "$APP/stock_history.jsonl" "$@"
+    exit $?
     ;;
   status)
-    (
-      while IFS='=' read -r key value; do
-        if [ -n "$key" ]; then export "$key=$value"; fi
-      done < "$APP/config.env"
-      python3 "$APP/check_stock.py" --status
-    )
+    as_service_user python3 "$APP/check_stock.py" --status
     exit $?
     ;;
   feed-key)
     FEED_KEY="${2:-}"
-    key_re='^ssh-ed25519 [A-Za-z0-9+/]+={0,3}( [A-Za-z0-9@._:+-]+)?$'
-    if ! [[ "$FEED_KEY" =~ $key_re ]]; then
+    if ! [[ "$FEED_KEY" =~ $KEY_RE ]]; then
       echo "Нужен открытый ключ ssh-ed25519 в кавычках: sudo bash $0 feed-key 'ssh-ed25519 AAAA… github'" >&2
       exit 1
     fi
     ;;
+  sync-key)
+    SYNC_KEY="${2:-}"
+    if ! [[ "$SYNC_KEY" =~ $KEY_RE ]]; then
+      echo "Нужен открытый ключ ssh-ed25519 запасного сервера в кавычках: sudo bash $0 sync-key 'ssh-ed25519 AAAA… standby'" >&2
+      exit 1
+    fi
+    if [ "$ROLE" = standby ]; then
+      echo "Это запасной сервер; sync-key ставится на основной." >&2
+      exit 1
+    fi
+    ;;
+  standby)
+    MAIN_HOST="${2:-}"
+    if ! [[ "$MAIN_HOST" =~ $HOST_RE ]]; then
+      echo "Нужен адрес основного сервера: sudo bash $0 standby MAIN_IP" >&2
+      exit 1
+    fi
+    if [ -n "${MAIN_HOST_KEY:-}" ] && ! [[ "$MAIN_HOST_KEY" =~ ^ssh-ed25519\ [A-Za-z0-9+/]+={0,3}$ ]]; then
+      echo "MAIN_HOST_KEY — ключ основного сервера вида 'ssh-ed25519 AAAA…' (из /etc/ssh/ssh_host_ed25519_key.pub)." >&2
+      exit 1
+    fi
+    ROLE=standby
+    ;;
   "") ;;
   *)
-    echo "Неизвестная команда: $1 (есть feed-key, status, report, uninstall)" >&2
+    echo "Неизвестная команда: $1 (есть feed-key, standby, sync-key, status, report, uninstall)" >&2
     exit 1
     ;;
 esac
@@ -103,7 +154,7 @@ id "$RUN_USER" >/dev/null 2>&1 || useradd --system --user-group --home-dir "$APP
 install -d -m 700 -o "$RUN_USER" -g "$RUN_USER" "$APP"
 install -m 644 -o "$RUN_USER" -g "$RUN_USER" "$SRC/check_stock.py" "$APP/check_stock.py"
 install -m 644 -o "$RUN_USER" -g "$RUN_USER" "$SRC/stock_report.py" "$APP/stock_report.py"
-if [ ! -f "$APP/stock_state.json" ] && [ -f "$SRC/stock_state.json" ]; then
+if [ "$ROLE" = main ] && [ ! -f "$APP/stock_state.json" ] && [ -f "$SRC/stock_state.json" ]; then
   install -m 644 -o "$RUN_USER" -g "$RUN_USER" "$SRC/stock_state.json" "$APP/stock_state.json"
 fi
 
@@ -115,20 +166,17 @@ if [ ! -f "$APP/config.env" ]; then
   chown "$RUN_USER:$RUN_USER" "$APP/config.env"
 
   echo "Проверяю Apple и Telegram — в Telegram придёт тестовое сообщение…"
-  if ! (
-    while IFS='=' read -r key value; do
-      if [ -n "$key" ]; then export "$key=$value"; fi
-    done < "$APP/config.env"
-    "$PYTHON" "$APP/check_stock.py" --test-telegram
-  ); then
+  if ! as_service_user "$PYTHON" "$APP/check_stock.py" --test-telegram; then
     rm -f "$APP/config.env"
     echo "Telegram не принял токен или chat ID. Запустите установку ещё раз и введите их заново." >&2
     exit 1
   fi
 fi
+chown "$RUN_USER:$RUN_USER" "$APP/config.env"  # also when copied here from the main server
+chmod 600 "$APP/config.env"
 
-# GitHub's way in. Its home, key and program belong to root, so the key can do nothing but
-# hand in checks, even if it leaks.
+# The way in for GitHub and a standby. Its home, keys and program belong to root, so a key can
+# do nothing but its one command, even if it leaks.
 id "$FEED_USER" >/dev/null 2>&1 || useradd --system --user-group --home-dir "$FEED_HOME" --shell /bin/sh "$FEED_USER"
 install -d -m 755 -o root -g root "$FEED_HOME" "$FEED_HOME/.ssh" "$FEED_LIB"
 install -m 644 -o root -g root "$SRC/check_stock.py" "$FEED_LIB/check_stock.py"
@@ -136,10 +184,61 @@ install -d -m 2770 -o "$FEED_USER" -g "$RUN_USER" "$INBOX"
 if [ -n "$FEED_KEY" ]; then
   printf '%s\n' "$FEED_KEY" > "$FEED_HOME/.ssh/feed_key.pub"
 fi
-if [ -f "$FEED_HOME/.ssh/feed_key.pub" ]; then
-  printf 'restrict,command="%s -I %s/check_stock.py --ingest %s --source github" %s\n' \
-    "$PYTHON" "$FEED_LIB" "$INBOX" "$(head -n 1 "$FEED_HOME/.ssh/feed_key.pub")" > "$FEED_HOME/.ssh/authorized_keys"
-  chmod 644 "$FEED_HOME/.ssh/feed_key.pub" "$FEED_HOME/.ssh/authorized_keys"
+if [ -n "$SYNC_KEY" ]; then
+  printf '%s\n' "$SYNC_KEY" > "$FEED_HOME/.ssh/sync_key.pub"
+fi
+{
+  if [ -f "$FEED_HOME/.ssh/feed_key.pub" ]; then
+    printf 'restrict,command="%s -I %s/check_stock.py --ingest %s --source github" %s\n' \
+      "$PYTHON" "$FEED_LIB" "$INBOX" "$(head -n 1 "$FEED_HOME/.ssh/feed_key.pub")"
+  fi
+  if [ "$ROLE" = main ] && [ -f "$FEED_HOME/.ssh/sync_key.pub" ]; then
+    printf 'restrict,command="%s -I %s/check_stock.py --sync %s" %s\n' \
+      "$PYTHON" "$FEED_LIB" "$INBOX" "$(head -n 1 "$FEED_HOME/.ssh/sync_key.pub")"
+  fi
+} > "$FEED_HOME/.ssh/authorized_keys.new"
+if [ -s "$FEED_HOME/.ssh/authorized_keys.new" ]; then
+  chmod 644 "$FEED_HOME/.ssh/authorized_keys.new" "$FEED_HOME"/.ssh/*.pub
+  mv "$FEED_HOME/.ssh/authorized_keys.new" "$FEED_HOME/.ssh/authorized_keys"
+else
+  rm -f "$FEED_HOME/.ssh/authorized_keys.new" "$FEED_HOME/.ssh/authorized_keys"
+fi
+
+# A standby asks the main server how it is with its own key, as the service user.
+if [ "$ROLE" = standby ]; then
+  printf 'standby %s\n' "$MAIN_HOST" > "$ROLE_FILE"
+  chmod 644 "$ROLE_FILE"
+  install -d -m 700 -o "$RUN_USER" -g "$RUN_USER" "$APP/.ssh"
+  if [ ! -f "$APP/.ssh/sync_key" ]; then
+    ssh-keygen -q -t ed25519 -N '' -C "standby-$(hostname -s)" -f "$APP/.ssh/sync_key"
+  fi
+  if [ -n "${MAIN_HOST_KEY:-}" ]; then
+    printf '%s %s\n' "$MAIN_HOST" "$MAIN_HOST_KEY" > "$APP/.ssh/known_hosts"
+  elif [ ! -s "$APP/.ssh/known_hosts" ]; then
+    ssh-keyscan -t ed25519 "$MAIN_HOST" 2>/dev/null > "$APP/.ssh/known_hosts" || true
+  fi
+  cat > "$APP/.ssh/config" <<EOF
+Host main
+  HostName $MAIN_HOST
+  User $FEED_USER
+  IdentityFile $APP/.ssh/sync_key
+  IdentitiesOnly yes
+  UserKnownHostsFile $APP/.ssh/known_hosts
+  StrictHostKeyChecking yes
+  BatchMode yes
+  ConnectTimeout 15
+  ServerAliveInterval 15
+  ServerAliveCountMax 2
+  ControlMaster auto
+  ControlPath $APP/.ssh/cm-%C
+  ControlPersist 10m
+EOF
+  chown "$RUN_USER:$RUN_USER" "$APP/.ssh/sync_key" "$APP/.ssh/sync_key.pub" "$APP/.ssh/known_hosts" "$APP/.ssh/config"
+  chmod 600 "$APP/.ssh/sync_key" "$APP/.ssh/config"
+  chmod 644 "$APP/.ssh/sync_key.pub" "$APP/.ssh/known_hosts"
+  WATCH="--watch --every $EVERY --offset $OFFSET --status-minutes $STATUS_MINUTES --inbox $INBOX --source backup --standby-of main"
+else
+  WATCH="--watch --every $EVERY --offset $OFFSET --status-minutes $STATUS_MINUTES --inbox $INBOX"
 fi
 
 remove_units
@@ -154,7 +253,7 @@ Type=simple
 User=$RUN_USER
 WorkingDirectory=$APP
 EnvironmentFile=$APP/config.env
-ExecStart=$PYTHON -u $APP/check_stock.py --watch --every $EVERY --offset $OFFSET --status-minutes $STATUS_MINUTES --inbox $INBOX
+ExecStart=$PYTHON -u $APP/check_stock.py $WATCH
 Restart=always
 RestartSec=30
 NoNewPrivileges=yes
@@ -167,7 +266,10 @@ ReadWritePaths=$APP $INBOX
 WantedBy=multi-user.target
 EOF
 
-cat > "$UNIT_DIR/$NAME-bot.service" <<EOF
+# The bot answers on the main server only: Telegram lets one computer read the bot's messages.
+UNITS=("$NAME.service")
+if [ "$ROLE" = main ]; then
+  cat > "$UNIT_DIR/$NAME-bot.service" <<EOF
 [Unit]
 Description=Telegram /iphone command for the Apple Store Hong Kong stock watch
 Wants=network-online.target
@@ -189,15 +291,30 @@ PrivateTmp=yes
 [Install]
 WantedBy=multi-user.target
 EOF
+  UNITS+=("$NAME-bot.service")
+fi
 
 systemctl daemon-reload
-systemctl enable --now "$NAME.service" "$NAME-bot.service"
+systemctl enable --now "${UNITS[@]}"
 sleep 5
 journalctl -u "$NAME.service" -u "$NAME-bot.service" -n 6 --no-pager -o cat || true
-echo "Готово: сервер проверяет каждые $EVERY с (сдвиг $OFFSET с), сводка раз в $STATUS_MINUTES мин; бот отвечает на /iphone и /report. Всё запускается и после перезагрузки."
-if [ -f "$FEED_HOME/.ssh/authorized_keys" ]; then
+if [ "$ROLE" = standby ]; then
+  echo "Готово: запасной сервер для $MAIN_HOST. Пока основной работает, он не проверяет; если основной не работает 3 мин — проверяет сам каждые $EVERY с."
+  if runuser -u "$RUN_USER" -- ssh -F "$APP/.ssh/config" -T main < /dev/null > /dev/null 2>&1; then
+    echo "Связь с основным сервером есть."
+  else
+    echo "Основной сервер пока не отвечает этому: выполните там команду ниже. Пока связи не было ни разу, запасной не подменяет основной."
+  fi
+  echo "Ключ этого сервера для основного (выполнить там): sudo bash vps_install.sh sync-key '$(cat "$APP/.ssh/sync_key.pub")'"
+else
+  echo "Готово: сервер проверяет каждые $EVERY с (сдвиг $OFFSET с), сводка раз в $STATUS_MINUTES мин; бот отвечает на /iphone и /report. Всё запускается и после перезагрузки."
+fi
+if [ -f "$FEED_HOME/.ssh/feed_key.pub" ]; then
   echo "GitHub может передавать свои проверки (ключ установлен)."
 else
   echo "Чтобы GitHub передавал свои проверки: sudo bash $0 feed-key 'ssh-ed25519 AAAA… github'"
 fi
-echo "Логи: journalctl -u $NAME -f  и  journalctl -u $NAME-bot -f"
+if [ "$ROLE" = main ] && [ -f "$FEED_HOME/.ssh/sync_key.pub" ]; then
+  echo "Запасной сервер может узнавать, работает ли этот (ключ установлен)."
+fi
+echo "Логи: journalctl -u $NAME -f$([ "$ROLE" = main ] && echo "  и  journalctl -u $NAME-bot -f")"
