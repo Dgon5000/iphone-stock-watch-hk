@@ -94,7 +94,14 @@ MAIN_SILENT_AFTER = timedelta(minutes=3)
 RETURN_WAIT = timedelta(minutes=2)
 HANDBACK_QUIET = timedelta(seconds=75)  # after a handback, until the standby has stood aside
 MAX_SYNC_BYTES = 16 * 1024 * 1024
-STATUS_SYNC = "status.sync"  # the main server: alive when, last check, stock
+# While the main server works, the standby also checks in place of a computer that could
+# not reach Apple at all (network, timeouts) FILL_AFTER times in a row, or of GitHub when
+# nothing came from it for FILL_AFTER_SILENCE — never because Apple refused or answered
+# with an error: a refusal means "less often", not "from elsewhere". Its checks go to the
+# main server, which asks for them in STATUS_SYNC ("fill").
+FILL_AFTER = 2
+FILL_AFTER_SILENCE = timedelta(seconds=150)
+STATUS_SYNC = "status.sync"  # the main server: alive when, last check, stock, checks wanted
 HANDBACK_SYNC = "handback.sync"  # the standby's stock after standing in
 HISTORY_SYNC = "history-*.sync"  # the standby's checks while standing in
 # Telegram bot (--bot): commands in the bot's menu, commands older than this are ignored
@@ -223,6 +230,12 @@ def color_emoji(color):
 def source_name(source):
     """How a checking computer is called in logs and messages: "github" -> GitHub."""
     return SOURCE_NAMES.get(source, source)
+
+
+def unreachable(error):
+    """Whether a check failed because the computer could not reach Apple (network, timeouts),
+    not because Apple answered with an error (see request_stores)."""
+    return str(error).startswith("Could not reach Apple")
 
 
 def read_state():
@@ -794,8 +807,9 @@ class Status:
         if period != self.period and not reported:
             minutes = max(1, round((moment - self.since).total_seconds() / 60))
             footer = f"🔁 Проверок за {minutes} мин: {sum(self.counts.values())}"
-            if len(sources) > 1:
-                footer += " — " + ", ".join(f"{source_name(s)} {self.counts[s]}" for s in sources)
+            shown = list(sources) + sorted(s for s in self.counts if s and s not in sources)  # a standby filling in
+            if len(shown) > 1:
+                footer += " — " + ", ".join(f"{source_name(s)} {self.counts[s]}" for s in shown)
             message = status_message(result, parts, footer)
             if dry_run:
                 print(f"--- dry run, status not sent ---\n{message}\n---", flush=True)
@@ -902,11 +916,13 @@ class SellOuts:
 class Sources:
     """The computers that check (this server, GitHub, …) and when each last had an answer
     from Apple. Tells Telegram once when one has had none for PROBLEM_ALERT_AFTER while
-    another still works, and once when it is back; if none works, that is report_health's."""
+    another still works, and once when it is back; if none works, that is report_health's.
+    `occasional` computers (a standby filling in) count as working but may fall silent."""
 
-    def __init__(self, state, now):
+    def __init__(self, state, now, occasional=()):
         self.state = state
-        self.since = {s: now for s in state.get("sources") or [] if isinstance(s, str)}
+        self.occasional = set(occasional)
+        self.since = {s: now for s in state.get("sources") or [] if isinstance(s, str) and s not in self.occasional}
         self.ok = {}
         self.errors = {}
 
@@ -914,7 +930,7 @@ class Sources:
         return list(self.since)
 
     def seen(self, source, moment, error=None):
-        if source not in self.since:
+        if source not in self.since and source not in self.occasional:
             self.since[source] = moment
             self.state["sources"] = sorted(self.since)
         if error is None:
@@ -956,15 +972,21 @@ class Watcher:
     With `shared` (the inbox folder) it is the main server for a standby: it says there how
     it is (STATUS_SYNC) and takes back what the standby did while standing in."""
 
-    def __init__(self, parts, dry_run, status_minutes, source, shared=None):
-        self.parts, self.dry_run, self.source = parts, dry_run, source
+    def __init__(self, parts, dry_run, status_minutes, source, shared=None, offset=0):
+        self.parts, self.dry_run, self.source, self.offset = parts, dry_run, source, offset
         self.state = read_state()
         self.sell_outs = SellOuts()
         self.status = Status(status_minutes)
-        self.sources = Sources(self.state, utc_now())
+        self.shared = Path(shared) if shared else None
+        self.sources = Sources(self.state, utc_now(), occasional=("backup",) if self.shared else ())
         self.latest = None  # Apple's time of the newest check acted upon
         self.stuck = set()  # inbox files that could not be removed
-        self.shared = Path(shared) if shared else None
+        # For fills(): per computer, checks in a row that could not reach Apple, whether Apple
+        # refused its last check, when it last checked, and the second of the minute it checks at.
+        self.unreachable = Counter()
+        self.refused = {}
+        self.last_check = {}
+        self.slot = {}
         self.wait_until = None  # back after a break: report changes only after the standby's stock
         alive = parse_utc(read_shared(self.shared / STATUS_SYNC).get("alive")) if self.shared else None
         if alive and utc_now() - alive > MAIN_SILENT_AFTER:
@@ -985,6 +1007,7 @@ class Watcher:
             "alive": utc_now().isoformat(timespec="seconds"),
             "checked": self.latest.isoformat(timespec="seconds") if self.latest else None,
             "available": self.state.get("available") or [],
+            "fill": self.fills(utc_now()),
         }
         try:
             write_shared(self.shared / STATUS_SYNC, status, mode=0o644)
@@ -1022,6 +1045,29 @@ class Watcher:
                 append_history(lines)
                 log(f"Added the standby's {len(lines)} check(s) to the history.")
 
+    def note(self, source, moment, result, error):
+        """How each computer's checks go, for fills(). A standby's own are not its business."""
+        if source == "backup":
+            return
+        failed = result is None
+        self.unreachable[source] = self.unreachable[source] + 1 if failed and unreachable(error) else 0
+        self.refused[source] = failed and not unreachable(error)
+        self.last_check[source] = max(self.last_check.get(source, moment), moment)
+        if not failed:
+            self.slot[source] = int(moment.timestamp()) % 60
+
+    def fills(self, now):
+        """The checks a standby should make in place of a computer that cannot (FILL_AFTER), as
+        [{"source": "github", "offset": 30}], offset in seconds past the minute."""
+        wanted = []
+        for source, last in self.last_check.items():
+            failing = self.unreachable[source] >= FILL_AFTER
+            silent = source != self.source and not self.refused.get(source) and now - last >= FILL_AFTER_SILENCE
+            offset = self.offset if source == self.source else self.slot.get(source)
+            if (failing or silent) and offset is not None:
+                wanted.append({"source": source, "offset": offset})
+        return wanted
+
     def record(self, result, error, source, moment):
         return record_history(result, error, source, moment)
 
@@ -1053,6 +1099,7 @@ class Watcher:
         if not self.dry_run:
             self.record(result, error, source, moment)
         self.sources.seen(source, moment, error)
+        self.note(source, moment, result, error)
         problem = None
         if result is None:
             log(f"{label}: ERROR: {error}", error=True)
@@ -1090,7 +1137,9 @@ class Standby(Watcher):
     asks the main server how it is (`ssh HOST` runs --sync there) and keeps a copy of its stock.
     When the main server has not been working for MAIN_SILENT_AFTER it checks and reports
     itself, also handling GitHub's checks (which then come here); when the main server works
-    again it hands back its stock and its checks and stands aside."""
+    again it hands back its stock and its checks and stands aside.
+    While the main server works, it also checks in place of a computer the main server asks
+    for (see FILL_AFTER), and passes on GitHub's checks that could not reach the main server."""
 
     def __init__(self, parts, dry_run, status_minutes, source, main):
         super().__init__(parts, dry_run, status_minutes, source)
@@ -1098,6 +1147,7 @@ class Standby(Watcher):
         self.active = False
         self.down_since = None
         self.history = []  # checks made while standing in, for the main server's history
+        self.fill = {}  # second of the minute -> the computer to check in place of
 
     def checking(self):
         return self.active
@@ -1110,8 +1160,37 @@ class Standby(Watcher):
     def take_inbox(self, inbox):
         if self.active:
             return super().take_inbox(inbox)
-        for path in Path(inbox).glob("*.json"):  # GitHub's checks are the main server's business
+        # GitHub could not reach the main server: pass its checks on, if the main server works.
+        for path in sorted(Path(inbox).glob("*.json")):
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                data = None
             remove(path)
+            if data is not None and self.down_since is None:
+                _, problem = exchange(self.main, {"check": data})
+                if problem:
+                    log(f"ERROR: could not pass GitHub's check on to the main server: {problem}", error=True)
+                else:
+                    log("Passed GitHub's check on to the main server.")
+
+    def next_fill(self, now):
+        """When to check next in place of another computer (math.inf: not asked to)."""
+        if self.active or not self.fill:
+            return math.inf
+        return min(next_slot(now, 60, offset) for offset in self.fill)
+
+    def fill_in(self, backoff, due):
+        """Check in place of the computer the main server asked for and hand the check to it.
+        Apple's refusal pauses this like any other check (see Backoff)."""
+        missing = self.fill.get(int(due) % 60)
+        if missing is None or not backoff.allows(due):
+            return
+        result, error = backoff.look(self.parts)
+        log(f"For {source_name(missing)}: " + (summary(result, self.parts) if result else f"ERROR: {error}"))
+        _, problem = exchange(self.main, {"check": check_to_json(self.source, result, error)})
+        if problem:
+            log(f"ERROR: could not hand the check to the main server: {problem}", error=True)
 
     def sync(self):
         """Ask the main server how it is: keep its stock, stand in, or hand back."""
@@ -1125,6 +1204,7 @@ class Standby(Watcher):
             alive = parse_utc(reply.get("alive")) if reply else None
         if reply is not None and not self.dry_run:
             self.state["main_seen_utc"] = now.isoformat(timespec="seconds")
+        self.fill = fill_from_json(reply.get("fill")) if alive and now - alive < MAIN_SILENT_AFTER else {}
         if alive and now - alive < MAIN_SILENT_AFTER:
             self.down_since = None
             if self.active:  # the stock went with this call
@@ -1168,6 +1248,18 @@ class Standby(Watcher):
             tell(f"⚠️ Основной сервер не работает уже {minutes} мин ({why}). Проверку продолжает запасной сервер.")
 
 
+def fill_from_json(items):
+    """The main server's request (see Watcher.fills) as {second of the minute: computer}."""
+    fill = {}
+    for item in items if isinstance(items, list) else []:
+        if isinstance(item, dict) and isinstance(item.get("offset"), int) and 0 <= item["offset"] < 60:
+            try:
+                fill[item["offset"]] = text(item.get("source"), 20)
+            except ValueError:
+                continue
+    return fill
+
+
 def run_slots(parts, every, offset, dry_run, status_minutes=0, inbox=None, source="vps", standby_of=None):
     """Check at fixed times on the clock, `offset` seconds past every multiple of `every`
     seconds (60 and 0: at :00 of every minute), and in between handle the checks other
@@ -1177,10 +1269,11 @@ def run_slots(parts, every, offset, dry_run, status_minutes=0, inbox=None, sourc
         watcher = Standby(parts, dry_run, status_minutes, source, standby_of)
         sync_due = next_slot(time.time(), 60, SYNC_OFFSET)
     else:
-        watcher = Watcher(parts, dry_run, status_minutes, source, shared=inbox)
+        watcher = Watcher(parts, dry_run, status_minutes, source, shared=inbox, offset=offset)
         sync_due = math.inf
     backoff = Backoff()
     due = next_slot(time.time(), every, offset)
+    fill_due = math.inf
     while True:
         if inbox:
             watcher.take_inbox(inbox)
@@ -1188,6 +1281,10 @@ def run_slots(parts, every, offset, dry_run, status_minutes=0, inbox=None, sourc
         if now >= sync_due:
             watcher.sync()
             sync_due = next_slot(time.time(), 60, SYNC_OFFSET)
+            fill_due = watcher.next_fill(time.time())
+        elif now >= fill_due:
+            watcher.fill_in(backoff, fill_due)
+            fill_due = watcher.next_fill(time.time())
         elif now >= due:
             if watcher.checking() and backoff.allows(due):
                 result, error = backoff.look(parts)
@@ -1196,7 +1293,7 @@ def run_slots(parts, every, offset, dry_run, status_minutes=0, inbox=None, sourc
                 watcher.beat()
             due = next_slot(time.time(), every, offset)
         else:
-            wait = min(due, sync_due) - now
+            wait = min(due, sync_due, fill_due) - now
             time.sleep(min(wait, 1.0) if inbox else wait)
 
 
@@ -1336,21 +1433,27 @@ def ingest(inbox, source, stream):
                 raise ValueError("not a JSON object")
             data["source"] = source
             check_from_json(data)
-            waiting = sorted(inbox.glob("*.json"))
-            if len(waiting) >= INBOX_LIMIT:
-                raise ValueError(f"{len(waiting)} checks are waiting on the server; is the watcher running?")
-            if oldest_age(waiting) > INBOX_STALE_SECONDS:
-                minutes = int(oldest_age(waiting) // 60)
-                raise ValueError(f"the watcher on the server has not read checks for {minutes} min; is it running?")
-            name = f"{time.time_ns()}-{os.getpid()}"
-            temporary = inbox / f".{name}.tmp"
-            with open(os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o640), "w", encoding="utf-8") as f:
-                f.write(json.dumps(data, ensure_ascii=False))
-            os.replace(temporary, inbox / f"{name}.json")
+            save_check(inbox, data)
     except (OSError, ValueError) as exc:
         print(f"ERROR: check not taken: {exc}", file=sys.stderr, flush=True)
         return 1
     return 0
+
+
+def save_check(inbox, data):
+    """Put a checked check (see check_from_json) into the inbox for the watcher. ValueError if
+    the watcher has stopped reading it."""
+    waiting = sorted(inbox.glob("*.json"))
+    if len(waiting) >= INBOX_LIMIT:
+        raise ValueError(f"{len(waiting)} checks are waiting on the server; is the watcher running?")
+    if oldest_age(waiting) > INBOX_STALE_SECONDS:
+        minutes = int(oldest_age(waiting) // 60)
+        raise ValueError(f"the watcher on the server has not read checks for {minutes} min; is it running?")
+    name = f"{time.time_ns()}-{os.getpid()}"
+    temporary = inbox / f".{name}.tmp"
+    with open(os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o640), "w", encoding="utf-8") as f:
+        f.write(json.dumps(data, ensure_ascii=False))
+    os.replace(temporary, inbox / f"{name}.json")
 
 
 def over_ssh(host, data):
@@ -1389,8 +1492,9 @@ def exchange(main, payload):
 def sync(shared, stream, out):
     """--sync (the main server's SSH command for its standby): keep what the standby hands back
     after standing in — its stock, then its checks — in the `shared` folder for the watcher
-    here, and answer with this server's status (STATUS_SYNC). Returns 1, with the reason on
-    stderr, if what came is not right."""
+    here, take a check it made in place of another computer or passed on from GitHub (into
+    the inbox, which `shared` is), and answer with this server's status (STATUS_SYNC).
+    Returns 1, with the reason on stderr, if what came is not right."""
     shared = Path(shared)
     try:
         raw = stream.read(MAX_SYNC_BYTES + 1)
@@ -1403,6 +1507,12 @@ def sync(shared, stream, out):
             write_shared(shared / HANDBACK_SYNC, {"available": stock_from_json(data["available"])})
         if "history" in data:
             write_shared(shared / f"history-{time.time_ns()}.sync", history_from_json(data["history"]))
+        if "check" in data:  # the standby's check in place of another computer, or GitHub's passed on
+            check = data["check"]
+            if not isinstance(check, dict) or check.get("source") not in ("backup", "github"):
+                raise ValueError("bad check")
+            check_from_json(check)
+            save_check(shared, check)
         status = read_shared(shared / STATUS_SYNC)
         alive = parse_utc(status.get("alive"))
         if alive:  # by this server's clock, so that the two servers' clocks need not agree

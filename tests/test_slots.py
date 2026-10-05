@@ -13,7 +13,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 
 from test_telegram import CATALOG, PRO_MAX, PROJECT, STORES, Base, Clock, check_html
 
@@ -426,7 +426,7 @@ class MainServer(SharedBase):
         self.run_until(hkt("10:02:10"))
         status = json.loads((self.inbox / "status.sync").read_text())
         self.assertEqual(status, {"alive": "2026-10-03T02:02:00+00:00", "checked": "2026-10-03T02:02:00+00:00",
-                                  "available": SILVER})
+                                  "available": SILVER, "fill": []})
         self.assertEqual((self.inbox / "status.sync").stat().st_mode & 0o777, 0o644)  # the --sync user reads it
 
     def test_back_after_a_break_it_waits_two_minutes_then_reports(self):
@@ -481,6 +481,62 @@ class MainServer(SharedBase):
         self.assertIn("🕐 Проверено: 03.10.2026 10:02 (HKT)", alert)  # GitHub's 10:02:30, after the quiet
 
 
+class MainFills(SharedBase):
+    """The main server asks the standby to check in place of a computer that cannot reach
+    Apple, or of a silent GitHub — never of one Apple refused."""
+
+    def fills_at(self, *times):
+        seen = {}
+
+        def look(now):
+            if now in times:
+                seen[now] = json.loads((self.inbox / "status.sync").read_text())["fill"]
+
+        self.clock.hooks.append(look)
+        return seen
+
+    def test_two_checks_without_reaching_apple_ask_the_standby_until_one_works(self):
+        down = URLError("timed out")
+        self.world.apple_errors = [down] * 4  # 10:01 and 10:02, each with its retry
+        seen = self.fills_at(hkt("10:01:20"), hkt("10:02:20"), hkt("10:03:20"))
+        self.run_until(hkt("10:03:30"))
+        self.assertEqual(seen, {hkt("10:01:20"): [], hkt("10:02:20"): [{"source": "vps", "offset": 0}], hkt("10:03:20"): []})
+
+    def test_apples_refusals_never_ask_the_standby(self):
+        self.world.apple_errors = [HTTPError("u", 541, "", {}, io.BytesIO(b"")) for _ in range(5)]
+        seen = self.fills_at(*(hkt(f"10:{m:02d}:20") for m in range(1, 12)))
+        self.run_until(hkt("10:12:00"))
+        self.assertEqual(set(json.dumps(f) for f in seen.values()), {"[]"})
+
+    def test_a_silent_github_is_filled_in_unless_apple_had_refused_it(self):
+        self.github = lambda moment: set() if moment <= hkt("10:02:30") else None
+        seen = self.fills_at(hkt("10:04:20"), hkt("10:05:20"))
+        self.run_until(hkt("10:05:30"))
+        self.assertEqual(seen, {hkt("10:04:20"): [], hkt("10:05:20"): [{"source": "github", "offset": 30}]})
+
+    def test_github_silent_after_a_refusal_or_for_a_moment_is_not_filled_in(self):
+        refused = "Apple returned HTTP 541; not treating this as out of stock."
+        self.github = lambda moment: (set() if moment < hkt("10:02:00") else RuntimeError(refused) if moment < hkt("10:03:00")
+                                      else None if moment < hkt("10:09:00") else set() if moment < hkt("10:10:00")
+                                      else None if moment < hkt("10:11:30") else set())
+        seen = self.fills_at(*(hkt(f"10:{m:02d}:20") for m in range(1, 13)))
+        self.run_until(hkt("10:12:30"))  # silent 10:03–10:08 after a refusal; a gap of 90 s at 10:10–10:11
+        self.assertEqual(set(json.dumps(f) for f in seen.values()), {"[]"})
+
+    def test_the_standbys_checks_count_and_its_silence_is_no_alarm(self):
+        def standby(now):
+            if now == hkt("10:01:16"):  # in place of a computer that could not check at 10:01:15
+                data = self.cs.check_to_json("backup", self.result(set(), utc("10:01:15")))
+                self.assertEqual(self.cs.sync(self.inbox, io.BytesIO(json.dumps({"check": data}).encode()), io.StringIO()), 0)
+
+        self.clock.hooks.append(standby)
+        self.run_until(hkt("10:45:10"), status_minutes=10)
+        texts = self.texts()
+        self.assertTrue(texts[0].endswith("🔁 Проверок за 10 мин: 20 — VPS 9, GitHub 10, Запасной VPS 1"), texts[0])
+        self.assertFalse([t for t in texts if t.startswith("⚠️")])  # a standby is meant to be quiet
+        self.assertIn("Запасной VPS: 6 stores × 12 models checked", sys.stdout.getvalue())
+
+
 class SyncCommand(FakeClockBase):
     def setUp(self):
         super().setUp()
@@ -506,6 +562,16 @@ class SyncCommand(FakeClockBase):
         [saved] = self.shared.glob("history-*.sync")
         self.assertEqual(json.loads(saved.read_text()), lines)
 
+    def test_takes_a_check_made_in_place_of_another_computer(self):
+        data = self.cs.check_to_json("backup", self.result({("R409", U)}, utc("10:00:00")))
+        self.assertEqual(self.sync(json.dumps({"check": data}).encode())[0], 0)
+        [saved] = self.shared.glob("*.json")
+        self.assertEqual(json.loads(saved.read_text())["source"], "backup")
+        for source in ("vps", "evil"):
+            with self.subTest(source=source):
+                self.assertEqual(self.sync(json.dumps({"check": {**data, "source": source}}).encode())[0], 1)
+        self.assertEqual(len(list(self.shared.glob("*.json"))), 1)
+
     def test_refuses_what_is_not_right(self):
         with mock.patch.object(self.cs, "MAX_SYNC_BYTES", 200):
             for raw in (b"[1]", b"{not json", json.dumps({"available": "x"}).encode(),
@@ -527,6 +593,7 @@ class StandbyBase(FakeClockBase):
         self.main_down = False
         self.main_alive = None  # None: now
         self.main_age = None  # None: from main_alive
+        self.main_fill = lambda now: []  # what the main server asks the standby to check for
         self.main_stock = SILVER
         self.calls = []  # (time, what the standby sent)
         self.apple = lambda moment: {("R499", U)}
@@ -542,7 +609,7 @@ class StandbyBase(FakeClockBase):
             return subprocess.CompletedProcess(args, 255, b"", b"ssh: connect to host 198.51.100.7 port 22: Connection timed out\n")
         alive = self.main_alive or datetime.fromtimestamp(self.clock.now, timezone.utc).isoformat()
         age = self.main_age if self.main_age is not None else int(self.clock.now - datetime.fromisoformat(alive).timestamp())
-        reply = {"alive": alive, "available": self.main_stock, "age": age}
+        reply = {"alive": alive, "available": self.main_stock, "age": age, "fill": self.main_fill(self.clock.now)}
         return subprocess.CompletedProcess(args, 0, json.dumps(reply).encode(), b"")
 
     def github_check(self, stock, when):
@@ -565,10 +632,14 @@ class StandbyServer(StandbyBase):
         self.run_until(hkt("10:05:10"), lambda now: self.github_check({("R499", U)}, "10:01:30") if now == hkt("10:01:31") else None)
         self.assertEqual(self.world.apple_requests, [])
         self.assertEqual(self.world.sent(), [])
-        self.assertEqual([t for t, _ in self.calls], [hkt(f"10:0{m}:45") for m in range(5)])
-        self.assertEqual({json.dumps(p) for _, p in self.calls}, {"{}"})
+        syncs = [(t, p) for t, p in self.calls if "check" not in p]
+        self.assertEqual([t for t, _ in syncs], [hkt(f"10:0{m}:45") for m in range(5)])
+        self.assertEqual({json.dumps(p) for _, p in syncs}, {"{}"})
         self.assertEqual(self.state()["available"], self.main_stock)  # ready to stand in
-        self.assertEqual(list(self.inbox.glob("*.json")), [])  # GitHub's check was the main server's business
+        # GitHub's check that came here went on to the main server
+        [(when, passed)] = [(t, p) for t, p in self.calls if "check" in p]
+        self.assertEqual((when, passed["check"]["source"], passed["check"]["time"]), (hkt("10:01:31"), "github", "2026-10-03T02:01:30+00:00"))
+        self.assertEqual(list(self.inbox.glob("*.json")), [])
 
     def test_stands_in_and_hands_back(self):
         def world(now):
@@ -631,6 +702,31 @@ class StandbyFirstContact(StandbyBase):
         self.run_until(hkt("10:05:10"))
         self.assertTrue(self.texts()[0].startswith("⚠️ Основной сервер не работает уже 3 мин (нет связи)."))
         self.assertEqual(self.world.request_times, [hkt("10:04:00"), hkt("10:05:00")])
+
+
+class StandbyFillIn(StandbyBase):
+    def test_checks_in_place_of_the_computer_the_main_server_asks_for(self):
+        self.main_fill = lambda now: [{"source": "vps", "offset": 0}] if hkt("10:01:45") <= now < hkt("10:04:45") else []
+        self.run_until(hkt("10:07:10"))
+        self.assertEqual(self.world.request_times, [hkt("10:02:00"), hkt("10:03:00"), hkt("10:04:00")])
+        checks = [(t, p["check"]) for t, p in self.calls if "check" in p]
+        self.assertEqual([t for t, _ in checks], self.world.request_times)
+        self.assertEqual({c["source"] for _, c in checks}, {"backup"})
+        self.assertEqual(self.world.sent(), [])  # the main server decides what to send
+        self.assertIn("For VPS: 6 stores × 12 models checked", sys.stdout.getvalue())
+
+    def test_its_own_refusal_pauses_filling_in(self):
+        self.main_fill = lambda now: [{"source": "github", "offset": 30}]
+        self.world.apple_errors = [HTTPError("u", 541, "", {}, io.BytesIO(b""))]
+        self.run_until(hkt("10:05:40"))
+        self.assertEqual(self.world.request_times, [hkt("10:01:30"), hkt("10:03:30"), hkt("10:04:30"), hkt("10:05:30")])
+
+    def test_gives_nothing_on_while_the_main_server_is_out_of_reach(self):
+        (self.tmp / "stock_state.json").write_text(json.dumps({"main_seen_utc": "2026-10-03T01:00:00+00:00"}))
+        self.main_down = True
+        self.run_until(hkt("10:01:40"), lambda now: self.github_check({("R499", U)}, "10:01:30") if now == hkt("10:01:31") else None)
+        self.assertEqual([p for _, p in self.calls], [{}])  # just the sync at 10:00:45
+        self.assertEqual(list(self.inbox.glob("*.json")), [])
 
 
 class ProbeWithStandby(ProbeBase):
