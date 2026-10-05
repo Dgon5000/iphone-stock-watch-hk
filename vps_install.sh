@@ -1,14 +1,14 @@
 #!/bin/bash
 # Install the Apple Store Hong Kong stock watch on a Linux server with systemd
-# (Ubuntu, Debian and similar) as a service that checks at :40 of every minute and sends a
+# (Ubuntu, Debian and similar) as a service that checks every 45 seconds and sends a
 # quiet status every 10 minutes, plus a second service that answers /iphone and /report in
-# Telegram. GitHub checks at :00 and a participating standby at :20, handing results to
-# the main server over SSH: one state and one alert per change, with checks every 20 seconds.
+# Telegram. GitHub, the participating standby and the main server check at offsets
+# 0, 15 and 30 of a shared 45-second cycle: one state and checks every 15 seconds.
 # The second server also takes over if the main watcher stops working.
 # The services start again after reboots or crashes.
 #
 #   sudo bash vps_install.sh             install or update (asks for the Telegram token on the first run)
-#   sudo EVERY=60 OFFSET=40 STATUS_MINUTES=10 bash vps_install.sh   other check times (seconds) and status period (minutes, 0 = none)
+#   sudo EVERY=45 OFFSET=30 STATUS_MINUTES=10 bash vps_install.sh   other check times (seconds) and status period (minutes, 0 = none)
 #   sudo bash vps_install.sh feed-key 'ssh-ed25519 AAAA… github'   let GitHub hand in its checks with this SSH key
 #   sudo bash vps_install.sh standby MAIN_IP    make this server the standby of the main one (prints its key);
 #                                               MAIN_HOST_KEY='ssh-ed25519 AAAA…' gives the main server's host key
@@ -24,7 +24,7 @@ set -euo pipefail
 
 APP="${APP:-/opt/iphone-stock-watch-hk}"
 UNIT_DIR="${UNIT_DIR:-/etc/systemd/system}"
-EVERY="${EVERY:-60}"
+EVERY="${EVERY:-45}"
 OFFSET="${OFFSET:-}"
 PARTICIPATE="${PARTICIPATE:-1}"
 STATUS_MINUTES="${STATUS_MINUTES:-10}"
@@ -135,7 +135,7 @@ case "${1:-}" in
 esac
 
 if [ -z "$OFFSET" ]; then
-  if [ "$ROLE" = standby ]; then OFFSET=20; else OFFSET=40; fi
+  if [ "$ROLE" = standby ]; then OFFSET=15; else OFFSET=30; fi
 fi
 if ! [[ "$PARTICIPATE" =~ ^[01]$ ]]; then
   echo "PARTICIPATE — 1 (дополнительный сервер проверяет постоянно) или 0 (только резервирование)." >&2

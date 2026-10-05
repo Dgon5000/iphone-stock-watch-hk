@@ -5,9 +5,9 @@ Checks in-store pickup availability of the watched iPhone part numbers at every
 Apple Store in Hong Kong and sends one Telegram alert when a configuration comes
 into stock at any of them.
 
-Three computers share the checks: GitHub at :00 (--probe), a participating standby
-at :20 (--watch --standby-of HOST --participate), and the main server at :40 of every
-minute (--watch --every 60 --offset 40 --inbox DIR). Both remote computers hand their
+Three computers share a 45-second cycle: GitHub at offset 0 (--probe), a participating
+standby at offset 15 (--watch --standby-of HOST --participate), and the main server at
+offset 30 (--watch --every 45 --offset 30 --inbox DIR). Both remote computers hand their
 answers to the main server over SSH. Only the main server sends stock alerts and keeps
 the combined history while it is healthy; the standby takes over during an outage.
 """
@@ -562,27 +562,19 @@ def change_message(appeared, sold_out, parts, moment=None):
 
 
 def unavailable_summary(missing, watched):
-    """Out-of-stock configurations in one line: "512GB — все цвета; 1TB: Black, Glacier"."""
-    totals, gone = {}, {}
-    for item in watched:
-        model, storage, _ = describe(item["product"])
-        totals[(model, storage)] = totals.get((model, storage), 0) + 1
+    """One out-of-stock configuration per line, in watch-list order."""
+    several_models = len({describe(item["product"])[0] for item in watched}) > 1
+    pieces = []
     for item in missing:
         model, storage, color = describe(item["product"])
-        gone.setdefault((model, storage), []).append(color or item["partNumber"])
-    several_models = len({model for model, _ in totals}) > 1
-    pieces = []
-    for (model, storage), total in totals.items():  # watch-list order
-        colors = gone.get((model, storage))
-        if not colors:
-            continue
         name = escape(f"{model} {storage}".strip() if several_models or not storage else storage)
-        pieces.append(f"{name} — все цвета" if len(colors) == total else f"{name}: {escape(', '.join(colors))}")
-    return "; ".join(pieces)
+        variant = f"{color_emoji(color)} {name}" + (f" · {escape(color)}" if color else "")
+        pieces.append(f"• {variant}")
+    return "\n".join(pieces)
 
 
 def status_message(result, parts, footer=None):
-    """Everything watched: what is in stock now (with links) and, in one line, what is not.
+    """Everything watched: what is in stock now (with links), then unavailable variants.
     `footer` goes under the check time."""
     in_stock = {item["partNumber"] for item in result.available}
     watched = [{"partNumber": p, "product": result.products[p]} for p in parts if p in result.products]
@@ -594,7 +586,7 @@ def status_message(result, parts, footer=None):
     else:
         blocks.append("Сейчас ничего из отслеживаемого нет в наличии.")
     if missing:
-        blocks.append(f"➖ Нет в наличии: {unavailable_summary(missing, watched)}")
+        blocks.append(f"➖ Нет в наличии:\n{unavailable_summary(missing, watched)}")
     blocks.append(checked_at(result.checked_at) + (f"\n{footer}" if footer else ""))
     return "\n\n".join(blocks)
 
@@ -789,6 +781,45 @@ def check_once(parts, state, dry_run, prefix=""):
     return result, reported, alert_failed or problem is not None, problem
 
 
+def check_counts_footer(minutes, counts, sources=()):
+    """Telegram check totals, with a bold server name and count on each separate line."""
+    combined = Counter()
+    for source, count in counts.items():
+        combined["secondary" if source == "backup" else source] += count
+    wanted = {"secondary" if s == "backup" else s for s in sources if s}
+    wanted.update(s for s in combined if s)
+    shown = [s for s in ("vps", "secondary", "github") if s in wanted]
+    shown += sorted(wanted - set(shown))
+    lines = [f"🔁 Проверок за {minutes} мин: {sum(combined.values())}"]
+    for source in shown:
+        name = escape(COUNT_SOURCE_NAMES.get(source, source_name(source)))
+        lines.append(f"• <b>{name}</b> — {combined[source]}")
+    return "\n".join(lines)
+
+
+def recent_check_counts(minutes=10, now=None):
+    """Successful checks in the existing history; read only, for a manual status message."""
+    now = now or utc_now()
+    since = now - timedelta(minutes=minutes)
+    counts = Counter()
+    try:
+        with HISTORY_FILE.open(encoding="utf-8") as history:
+            for line in history:
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    continue  # a writer may still be appending the last line
+                if not isinstance(entry, dict):
+                    continue
+                moment = parse_utc(entry.get("time"))
+                source = entry.get("source")
+                if moment and since < moment <= now and "stores" in entry and isinstance(source, str):
+                    counts[source] += 1
+    except FileNotFoundError:
+        pass
+    return counts
+
+
 class Status:
     """A quiet summary of everything watched every `minutes` minutes on the clock (10:00,
     10:10, …): sent with the first check of a new period that reported no change, with how
@@ -810,10 +841,7 @@ class Status:
             self.period, self.since = period, moment
         if period != self.period and not reported:
             minutes = max(1, round((moment - self.since).total_seconds() / 60))
-            footer = f"🔁 Проверок за {minutes} мин: {sum(self.counts.values())}"
-            shown = list(sources) + sorted(s for s in self.counts if s and s not in sources)  # a standby filling in
-            if len(shown) > 1:
-                footer += " — " + ", ".join(f"{COUNT_SOURCE_NAMES.get(s, source_name(s))} {self.counts[s]}" for s in shown)
+            footer = check_counts_footer(minutes, self.counts, sources)
             message = status_message(result, parts, footer)
             if dry_run:
                 print(f"--- dry run, status not sent ---\n{message}\n---", flush=True)
@@ -976,8 +1004,9 @@ class Watcher:
     With `shared` (the inbox folder) it is the main server for a standby: it says there how
     it is (STATUS_SYNC) and takes back what the standby did while standing in."""
 
-    def __init__(self, parts, dry_run, status_minutes, source, shared=None, offset=0):
+    def __init__(self, parts, dry_run, status_minutes, source, shared=None, offset=0, every=60):
         self.parts, self.dry_run, self.source, self.offset = parts, dry_run, source, offset
+        self.every = every
         self.state = read_state()
         self.sell_outs = SellOuts()
         self.status = Status(status_minutes)
@@ -1012,6 +1041,7 @@ class Watcher:
             "checked": self.latest.isoformat(timespec="seconds") if self.latest else None,
             "available": self.state.get("available") or [],
             "fill": self.fills(utc_now()),
+            "every": self.every,
         }
         try:
             write_shared(self.shared / STATUS_SYNC, status, mode=0o644)
@@ -1058,11 +1088,11 @@ class Watcher:
         self.refused[source] = failed and not unreachable(error)
         self.last_check[source] = max(self.last_check.get(source, moment), moment)
         if not failed:
-            self.slot[source] = int(moment.timestamp()) % 60
+            self.slot[source] = 0 if self.every == 45 and source == "github" else int(moment.timestamp()) % self.every
 
     def fills(self, now):
         """The checks a standby should make in place of a computer that cannot (FILL_AFTER), as
-        [{"source": "github", "offset": 30}], offset in seconds past the minute."""
+        [{"source": "github", "offset": 0}], offset in this watcher's checking cycle."""
         wanted = []
         for source, last in self.last_check.items():
             failing = self.unreachable[source] >= FILL_AFTER
@@ -1147,8 +1177,9 @@ class Standby(Watcher):
     With --participate it also makes regular checks in its own slot, handing them to the
     main server without sending Telegram alerts until it needs to stand in."""
 
-    def __init__(self, parts, dry_run, status_minutes, source, main, participate=False, inbox=None):
-        super().__init__(parts, dry_run, status_minutes, source)
+    def __init__(self, parts, dry_run, status_minutes, source, main, participate=False, inbox=None,
+                 every=60, offset=0):
+        super().__init__(parts, dry_run, status_minutes, source, every=every, offset=offset)
         self.main = main
         self.participate = participate
         self.inbox = Path(inbox) if inbox else None
@@ -1156,6 +1187,7 @@ class Standby(Watcher):
         self.down_since = None
         self.history = []  # checks made while standing in, for the main server's history
         self.fill = {}  # second of the minute -> the computer to check in place of
+        self.fill_every = 60  # legacy main servers did not publish their cycle length
 
     def checking(self):
         return self.active or self.participate
@@ -1208,12 +1240,12 @@ class Standby(Watcher):
         """When to check next in place of another computer (math.inf: not asked to)."""
         if self.active or not self.fill:
             return math.inf
-        return min(next_slot(now, 60, offset) for offset in self.fill)
+        return min(next_slot(now, self.fill_every, offset) for offset in self.fill)
 
     def fill_in(self, backoff, due):
         """Check in place of the computer the main server asked for and hand the check to it.
         Apple's refusal pauses this like any other check (see Backoff)."""
-        missing = self.fill.get(int(due) % 60)
+        missing = self.fill.get(int(due) % self.fill_every)
         if missing is None or not backoff.allows(due):
             return
         result, error = backoff.look(self.parts)
@@ -1234,7 +1266,9 @@ class Standby(Watcher):
             alive = parse_utc(reply.get("alive")) if reply else None
         if reply is not None and not self.dry_run:
             self.state["main_seen_utc"] = now.isoformat(timespec="seconds")
-        self.fill = fill_from_json(reply.get("fill")) if alive and now - alive < MAIN_SILENT_AFTER else {}
+        every = reply.get("every", 60) if reply else 60
+        self.fill_every = every if isinstance(every, int) and not isinstance(every, bool) and every >= 10 else 60
+        self.fill = fill_from_json(reply.get("fill"), self.fill_every) if alive and now - alive < MAIN_SILENT_AFTER else {}
         if alive and now - alive < MAIN_SILENT_AFTER:
             self.down_since = None
             if self.active:  # the stock went with this call
@@ -1279,11 +1313,11 @@ class Standby(Watcher):
             tell(f"⚠️ Основной сервер не работает уже {minutes} мин ({why}). Проверку продолжает запасной сервер.")
 
 
-def fill_from_json(items):
-    """The main server's request (see Watcher.fills) as {second of the minute: computer}."""
+def fill_from_json(items, every=60):
+    """The main server's request (see Watcher.fills) as {offset within its cycle: computer}."""
     fill = {}
     for item in items if isinstance(items, list) else []:
-        if isinstance(item, dict) and isinstance(item.get("offset"), int) and 0 <= item["offset"] < 60:
+        if isinstance(item, dict) and isinstance(item.get("offset"), int) and not isinstance(item["offset"], bool) and 0 <= item["offset"] < every:
             try:
                 fill[item["offset"]] = text(item.get("source"), 20)
             except ValueError:
@@ -1298,10 +1332,10 @@ def run_slots(parts, every, offset, dry_run, status_minutes=0, inbox=None, sourc
     computers hand in through `inbox`. With `standby_of` (an ssh host) this
     is a standby for that main server (see Standby). Runs until stopped."""
     if standby_of:
-        watcher = Standby(parts, dry_run, status_minutes, source, standby_of, participate, inbox)
+        watcher = Standby(parts, dry_run, status_minutes, source, standby_of, participate, inbox, every, offset)
         sync_due = next_slot(time.time(), 60, SYNC_OFFSET)
     else:
-        watcher = Watcher(parts, dry_run, status_minutes, source, shared=inbox, offset=offset)
+        watcher = Watcher(parts, dry_run, status_minutes, source, shared=inbox, offset=offset, every=every)
         sync_due = math.inf
     backoff = Backoff()
     due = next_slot(time.time(), every, offset)
@@ -1828,7 +1862,9 @@ def main():
     if args.bot:
         return run_bot(parts)
     if args.status:
-        send_telegram(status_message(fetch_stock(parts), parts))
+        result = fetch_stock(parts)
+        footer = check_counts_footer(10, recent_check_counts(), ("vps", "secondary", "github"))
+        send_telegram(status_message(result, parts, footer))
         log("Status sent to Telegram.")
         return 0
     if args.every is not None and (args.every < 10 or not 0 <= args.offset < args.every):

@@ -183,7 +183,7 @@ class TagChecker(HTMLParser):
         self.text.append(data)
 
 
-FOOTER_RE = re.compile(r"\n\n🕐 Проверено: \d{2}\.\d{2}\.\d{4} \d{2}:\d{2} \(HKT\)(\n🔁 Проверок за \d+ мин: \d+( — .+)?)?$")
+FOOTER_RE = re.compile(r"\n\n🕐 Проверено: \d{2}\.\d{2}\.\d{4} \d{2}:\d{2} \(HKT\)(\n🔁 Проверок за \d+ мин: \d+(\n• [^\n]+)*)?$")
 
 
 def body(text):
@@ -471,7 +471,9 @@ class AlertScenarios(Base):
                 "📋 Наличие в Apple Store Hong Kong", "",
                 "🟢 В наличии · iPhone 18 Pro Max", "🩶 2TB · Silver — 🛒 Оформить", "🖤 2TB · Black — 🛒 Оформить",
             ])
-            self.assertEqual(lines[6], "➖ Нет в наличии: 512GB — все цвета; 1TB — все цвета; 2TB: Glacier, Burgundy")
+            self.assertEqual(lines[6:9], ["➖ Нет в наличии:", "• 🩶 512GB · Silver", "• 🖤 512GB · Black"])
+            self.assertEqual(lines[-2:], ["• 🩵 2TB · Glacier", "• ❤️ 2TB · Burgundy"])
+            self.assertEqual(len(lines[7:]), 10)  # each missing configuration has its own line
         self.assertFalse(self.world.sent()[0]["disable_notification"])  # change alerts keep their sound
 
     def test_status_with_pauses_of_1_2_3_minutes(self):
@@ -527,9 +529,34 @@ class AlertScenarios(Base):
         self.assertEqual(
             body(msg["text"]),
             "📋 Наличие в Apple Store Hong Kong\n\nСейчас ничего из отслеживаемого нет в наличии.\n\n"
-            "➖ Нет в наличии: 512GB — все цвета; 1TB — все цвета; 2TB — все цвета",
+            "➖ Нет в наличии:\n" + "\n".join(
+                f"• {emoji} {storage} · {color}"
+                for storage in ('512GB', '1TB', '2TB')
+                for emoji, color in (('🩶', 'Silver'), ('🖤', 'Black'), ('🩵', 'Glacier'), ('❤️', 'Burgundy'))),
         )
         self.assertIsNone(self.state())
+
+    def test_manual_status_uses_recent_counts_without_changing_history_or_state(self):
+        now = datetime(2026, 10, 3, 2, 10, tzinfo=timezone.utc)
+        history = self.tmp / 'stock_history.jsonl'
+        entries = [
+            {'time': (now - timedelta(minutes=11)).isoformat(), 'source': 'vps', 'stores': 6},
+            {'time': (now - timedelta(seconds=30)).isoformat(), 'source': 'vps', 'stores': 6},
+            {'time': (now - timedelta(seconds=15)).isoformat(), 'source': 'secondary', 'stores': 6},
+            {'time': now.isoformat(), 'source': 'github', 'stores': 6},
+            {'time': now.isoformat(), 'source': 'github', 'error': 'Apple returned HTTP 541'},
+        ]
+        history.write_text('\n'.join(json.dumps(e) for e in entries) + '\n')
+        state = self.tmp / 'stock_state.json'
+        state.write_text('{"available": []}')
+        before = (state.read_bytes(), history.read_bytes())
+        with mock.patch.object(self.cs, 'utc_now', return_value=now), \
+             mock.patch.object(sys, 'argv', ['check_stock.py', '--status']):
+            self.assertEqual(self.cs.main(), 0)
+        [message] = self.world.sent()
+        self.assertTrue(message['text'].endswith(
+            '🔁 Проверок за 10 мин: 3\n• <b>VPS 1</b> — 1\n• <b>VPS 2</b> — 1\n• <b>GitHub</b> — 1'))
+        self.assertEqual((state.read_bytes(), history.read_bytes()), before)
 
     def test_schedule_parsing(self):
         self.assertEqual(self.cs.parse_schedule("5,3,4"), [300, 180, 240])
