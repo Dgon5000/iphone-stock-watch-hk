@@ -565,7 +565,7 @@ class AlertScenarios(Base):
             self.assertEqual(self.cs.main(), 0)
         [message] = self.world.sent()
         self.assertTrue(message['text'].endswith(
-            '🔁 Проверок за 10 мин: 3\n• <b>VPS 1</b> — 1\n• <b>VPS 2</b> — 1\n• <b>GitHub</b> — 1'))
+            '🔁 Проверок за 10 мин: 3\n• <b>VPS 1</b> — 1\n• <b>VPS 2</b> — 1\n• <b>VPS 3</b> — 0\n• <b>GitHub</b> — 1'))
         self.assertEqual((state.read_bytes(), history.read_bytes()), before)
 
     def test_schedule_parsing(self):

@@ -599,6 +599,12 @@ class SyncCommand(FakeClockBase):
         [saved] = self.shared.glob("*.json")
         self.assertEqual(json.loads(saved.read_text()), data)
 
+    def test_passes_a_vps3_check_from_the_standby_to_the_main(self):
+        data = self.cs.check_to_json('third', self.result({('R409', U)}, utc('10:00:45')))
+        self.assertEqual(self.sync(json.dumps({'check': data}).encode())[0], 0)
+        [saved] = self.shared.glob('*.json')
+        self.assertEqual(json.loads(saved.read_text()), data)
+
     def test_refuses_what_is_not_right(self):
         with mock.patch.object(self.cs, "MAX_SYNC_BYTES", 200):
             for raw in (b"[1]", b"{not json", json.dumps({"available": "x"}).encode(),
@@ -732,6 +738,12 @@ class StandbyFirstContact(StandbyBase):
 
 
 class StandbyFillIn(StandbyBase):
+    def test_sync_does_not_skip_a_fill_at_the_same_second(self):
+        self.main_fill = lambda now: [{'source': 'third', 'offset': 45}]
+        self.run_until(hkt('10:03:10'))
+        self.assertEqual(self.world.request_times, [hkt(f'10:0{m}:45') for m in range(3)])
+        self.assertIn('For VPS 3:', sys.stdout.getvalue())
+
     def test_fill_checks_follow_the_main_servers_45_second_cycle(self):
         old_ssh = self.cs.subprocess.run
 
@@ -898,17 +910,17 @@ class ParticipatingStandby(StandbyBase):
         self.assertEqual(list(self.inbox.glob("*.json")), [])
 
 
-class ThreeComputerCycle(SharedBase):
+class FourComputerCycle(SharedBase):
     def setUp(self):
         super().setUp()
         self.clock.now = hkt("09:59:59")
-        self.next_checks = {"github": hkt("10:00:00"), "secondary": hkt("10:00:15")}
+        self.next_checks = {"github": hkt("10:00:00"), "secondary": hkt("10:00:15"), "third": hkt("10:00:45")}
 
     def hand_in(self, now):
         for source in self.next_checks:
             while now >= self.next_checks[source] + 1:
                 moment = self.next_checks[source]
-                self.next_checks[source] += 45
+                self.next_checks[source] += 60
                 data = self.cs.check_to_json(source, self.result(self.github(moment),
                                              datetime.fromtimestamp(moment, timezone.utc)))
                 self.assertEqual(self.ingest(self.inbox, source, io.BytesIO(json.dumps(data).encode() + b"\n")), 0)
@@ -922,24 +934,35 @@ class ThreeComputerCycle(SharedBase):
 
         self.clock.hooks.append(stop)
         with self.assertRaises(Stop):
-            self.cs.run_slots(list(PRO_MAX), 45, 30, False, 0, self.inbox, "vps")
+            self.cs.run_slots(list(PRO_MAX), 60, 30, False, 0, self.inbox, "vps")
         checks = [c for c in self.history() if "watched" not in c]
         expected = [(datetime.fromtimestamp(hkt('10:00:00') + i * 15, HKT).strftime('%H:%M:%S'),
-                     ('github', 'secondary', 'vps')[i % 3]) for i in range(20)]
+                     ('github', 'secondary', 'vps', 'third')[i % 4]) for i in range(20)]
         self.assertEqual([(c["time"][11:19], c["source"]) for c in checks], expected)
         times = [datetime.fromisoformat(c["time"]).timestamp() for c in checks]
         self.assertEqual([b - a for a, b in zip(times, times[1:])], [15] * 19)
-        self.assertEqual(json.loads((self.inbox / 'status.sync').read_text())['every'], 45)
+        self.assertEqual(json.loads((self.inbox / 'status.sync').read_text())['every'], 60)
         texts = self.texts()
         self.assertEqual(len(texts), 2)
         self.assertIn("🟢 Появились", texts[0])
         self.assertIn("🔴 Закончились", texts[1])
-        self.assertEqual(set(self.state()["sources"]), {"github", "secondary", "vps"})
+        self.assertEqual(set(self.state()["sources"]), {"github", "secondary", "vps", "third"})
+        footer = self.cs.check_counts_footer(5, {source: 5 for source in ('github', 'secondary', 'vps', 'third')})
+        self.assertIn('• <b>VPS 3</b> — 5', footer)
 
     def test_github_probe_uses_the_first_slot(self):
         with mock.patch.object(self.cs, "deliver", return_value=None):
-            self.assertEqual(self.cs.run_probe(list(PRO_MAX), "feed", 45, 0, minutes=3), 0)
-        self.assertEqual(self.world.request_times, [hkt('10:00:00') + i * 45 for i in range(4)])
+            self.assertEqual(self.cs.run_probe(list(PRO_MAX), "feed", 60, 0, minutes=3), 0)
+        self.assertEqual(self.world.request_times, [hkt('10:00:00') + i * 60 for i in range(3)])
+
+    def test_vps3_uses_the_last_slot_and_its_own_backoff(self):
+        self.world.apple_errors = [HTTPError('u', 541, '', {}, io.BytesIO(b''))]
+        delivered = []
+        with mock.patch.object(self.cs, 'deliver', side_effect=lambda host, data: delivered.append((host, data))):
+            self.assertEqual(self.cs.run_probe(list(PRO_MAX), 'feed', 60, 45, minutes=4, source='third', backup='feed2'), 0)
+        self.assertEqual(self.world.request_times, [hkt('10:00:45'), hkt('10:02:45'), hkt('10:03:45')])
+        self.assertTrue(all(data['source'] == 'third' for _, data in delivered))
+        self.assertIn('HTTP 541', delivered[0][1]['error'])
 
 
 class Installer(unittest.TestCase):
@@ -955,6 +978,7 @@ class Installer(unittest.TestCase):
                        'exec /usr/bin/install "${args[@]}"',
             "chown": 'echo "chown $*" >> "$SIM/calls.log"',
             "useradd": 'echo "useradd $*" >> "$SIM/calls.log"',
+            "getent": 'printf "stockwatch:x:999:999::%s:/usr/sbin/nologin\\n" "$APP"',
             "systemctl": 'echo "systemctl $*" >> "$SIM/calls.log"',
             "journalctl": 'echo "journalctl $*" >> "$SIM/calls.log"',
             "sleep": 'echo "sleep $*" >> "$SIM/calls.log"',
@@ -968,7 +992,7 @@ class Installer(unittest.TestCase):
             f.chmod(0o755)
         self.src = self.tmp / "src"
         self.src.mkdir()
-        for f in ("vps_install.sh", "check_stock.py", "stock_report.py"):
+        for f in ("vps_install.sh", "vps_probe_install.sh", "check_stock.py", "stock_report.py"):
             shutil.copy(PROJECT / f, self.src / f)
         self.app, self.units, self.feed, self.lib, self.inbox = (self.tmp / d for d in ("app", "units", "feed", "lib", "inbox"))
         self.app.mkdir()
@@ -994,7 +1018,7 @@ class Installer(unittest.TestCase):
         done = self.install("feed-key", self.KEY)
         self.assertEqual(done.returncode, 0, done.stderr)
         unit = (self.units / "iphone-stock-watch-hk.service").read_text()
-        self.assertIn(f"check_stock.py --watch --every 45 --offset 30 --status-minutes 10 --inbox {self.inbox}\n", unit)
+        self.assertIn(f"check_stock.py --watch --every 60 --offset 30 --status-minutes 10 --inbox {self.inbox}\n", unit)
         self.assertIn(f"ReadWritePaths={self.app} {self.inbox}\n", unit)
         self.assertEqual(self.keys(), f'restrict,command="{self.python} -I {self.lib}/check_stock.py --ingest {self.inbox} '
                                       f'--source github" {self.KEY}\n')
@@ -1048,7 +1072,7 @@ class Installer(unittest.TestCase):
         done = self.install("standby", "198.51.100.7", MAIN_HOST_KEY=self.MAIN_KEY)
         self.assertEqual(done.returncode, 0, done.stderr)
         unit = (self.units / "iphone-stock-watch-hk.service").read_text()
-        self.assertIn(f"--every 45 --offset 15 --status-minutes 10 --inbox {self.inbox} --source secondary --standby-of main --participate\n", unit)
+        self.assertIn(f"--every 60 --offset 15 --status-minutes 10 --inbox {self.inbox} --source secondary --standby-of main --participate\n", unit)
         self.assertFalse((self.units / "iphone-stock-watch-hk-bot.service").exists())  # the bot stays on the main server
         self.assertEqual((self.lib / "role").read_text(), "standby 198.51.100.7\n")
         ssh = self.app / ".ssh"
@@ -1116,6 +1140,45 @@ class Installer(unittest.TestCase):
         done = self.install("report")
         self.assertIn("В журнале пока нет проверок.", done.stderr)
         self.assertIn("runuser -u stockwatch -- python3", (self.tmp / "calls.log").read_text())
+
+    def test_vps3_feed_key_is_restricted_and_survives_an_update(self):
+        self.assertEqual(self.install('feed-key', self.KEY).returncode, 0)
+        third = self.KEY.replace('github-feed', 'vps3-feed')
+        done = self.install('probe-key', third)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        expected = f'restrict,command="{self.python} -I {self.lib}/check_stock.py --ingest {self.inbox} --source third" {third}'
+        self.assertIn(expected, self.keys().splitlines())
+        self.assertEqual(self.install().returncode, 0)
+        self.assertIn(expected, self.keys().splitlines())
+
+    def probe_install(self, **env):
+        return subprocess.run(['bash', str(self.src / 'vps_probe_install.sh')],
+                              env={**self.env, 'MAIN_HOST_KEY': self.MAIN_KEY, 'BACKUP_HOST_KEY': self.MAIN_KEY,
+                                   'START_SERVICE': '0', **env}, capture_output=True, text=True, timeout=60)
+
+    def test_vps3_installer_has_no_telegram_credentials_or_bot(self):
+        (self.app / 'config.env').unlink()
+        done = self.probe_install(PART_NUMBERS=U)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        unit = (self.units / 'iphone-stock-watch-hk.service').read_text()
+        self.assertIn('--probe feed --backup feed2 --every 60 --offset 45 --source third', unit)
+        self.assertIn('Restart=always', unit)
+        self.assertFalse((self.units / 'iphone-stock-watch-hk-bot.service').exists())
+        self.assertEqual((self.app / 'config.env').read_text(), f'PART_NUMBERS={U}\n')
+        self.assertEqual((self.app / '.ssh/feed_key').stat().st_mode & 0o777, 0o600)
+        self.assertIn('StrictHostKeyChecking yes', (self.app / '.ssh/config').read_text())
+        first_key = (self.app / '.ssh/feed_key.pub').read_text()
+        self.assertEqual(self.probe_install().returncode, 0)
+        self.assertEqual((self.app / '.ssh/feed_key.pub').read_text(), first_key)
+
+    def test_vps3_installer_refuses_to_replace_an_existing_main_role(self):
+        self.assertEqual(self.install().returncode, 0)
+        unit = self.units / 'iphone-stock-watch-hk.service'
+        before = unit.read_bytes()
+        done = self.probe_install()
+        self.assertEqual(done.returncode, 1)
+        self.assertIn('другая роль', done.stderr)
+        self.assertEqual(unit.read_bytes(), before)
 
     def test_bad_settings_and_commands_are_refused(self):
         for env in ({"EVERY": "5"}, {"OFFSET": "60"}, {"STATUS_MINUTES": "x"}, {"EVERY": "1m"}):

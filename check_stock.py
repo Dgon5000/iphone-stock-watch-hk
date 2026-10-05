@@ -5,9 +5,10 @@ Checks in-store pickup availability of the watched iPhone part numbers at every
 Apple Store in Hong Kong and sends one Telegram alert when a configuration comes
 into stock at any of them.
 
-Three computers share a 45-second cycle: GitHub at offset 0 (--probe), a participating
+Four computers share a 60-second cycle: GitHub at offset 0 (--probe), a participating
 standby at offset 15 (--watch --standby-of HOST --participate), and the main server at
-offset 30 (--watch --every 45 --offset 30 --inbox DIR). Both remote computers hand their
+offset 30 (--watch --every 60 --offset 30 --inbox DIR), then VPS 3 at offset 45 (--probe).
+All remote computers hand their
 answers to the main server over SSH. Only the main server sends stock alerts and keeps
 the combined history while it is healthy; the standby takes over during an outage.
 """
@@ -85,9 +86,9 @@ INBOX_LIMIT = 500
 INBOX_STALE_SECONDS = 300
 WORKING_WINDOW = timedelta(minutes=3)
 SOURCE_NAMES = {"vps": "VPS", "github": "GitHub", "mac": "Mac", "backup": "Запасной VPS",
-                "secondary": "Дополнительный VPS"}
+                "secondary": "Дополнительный VPS", "third": "VPS 3"}
 # Short server labels in Telegram's per-source check counts.
-COUNT_SOURCE_NAMES = {"vps": "VPS 1", "secondary": "VPS 2", "backup": "VPS 2"}
+COUNT_SOURCE_NAMES = {"vps": "VPS 1", "secondary": "VPS 2", "backup": "VPS 2", "third": "VPS 3"}
 # A standby server (--standby-of) asks the main server how it is at this many seconds past
 # every minute (--sync), keeping a copy of its stock. It stands in once the main server has
 # not been working for MAIN_SILENT_AFTER; back after a break that long, the main server
@@ -773,7 +774,7 @@ def check_counts_footer(minutes, counts, sources=()):
         combined["secondary" if source == "backup" else source] += count
     wanted = {"secondary" if s == "backup" else s for s in sources if s}
     wanted.update(s for s in combined if s)
-    shown = [s for s in ("vps", "secondary", "github") if s in wanted]
+    shown = [s for s in ("vps", "secondary", "third", "github") if s in wanted]
     shown += sorted(wanted - set(shown))
     lines = [f"🔁 Проверок за {minutes} мин: {sum(combined.values())}"]
     for source in shown:
@@ -1076,7 +1077,10 @@ class Watcher:
         self.refused[source] = failed and not unreachable(error)
         self.last_check[source] = max(self.last_check.get(source, moment), moment)
         if not failed:
-            self.slot[source] = 0 if self.every == 45 and source == "github" else int(moment.timestamp()) % self.every
+            if self.every == 60 and self.offset == 30 and source in ("github", "third"):
+                self.slot[source] = {"github": 0, "third": 45}[source]
+            else:
+                self.slot[source] = 0 if self.every == 45 and source == "github" else int(moment.timestamp()) % self.every
 
     def fills(self, now):
         """The checks a standby should make in place of a computer that cannot (FILL_AFTER), as
@@ -1333,7 +1337,12 @@ def run_slots(parts, every, offset, dry_run, status_minutes=0, inbox=None, sourc
             watcher.take_inbox(inbox)
         now = time.time()
         if now >= sync_due:
+            synced_slot = sync_due
             watcher.sync()
+            if int(synced_slot) % watcher.fill_every in watcher.fill:
+                # VPS 3's :45 slot coincides with the standby's status sync. Do not
+                # reschedule it to the next minute before making the requested fill.
+                watcher.fill_in(backoff, synced_slot)
             sync_due = next_slot(time.time(), 60, SYNC_OFFSET)
             fill_due = watcher.next_fill(time.time())
         elif now >= fill_due:
@@ -1563,7 +1572,7 @@ def sync(shared, stream, out):
             write_shared(shared / f"history-{time.time_ns()}.sync", history_from_json(data["history"]))
         if "check" in data:  # the standby's check in place of another computer, or GitHub's passed on
             check = data["check"]
-            if not isinstance(check, dict) or check.get("source") not in ("backup", "secondary", "github"):
+            if not isinstance(check, dict) or check.get("source") not in ("backup", "secondary", "third", "github"):
                 raise ValueError("bad check")
             check_from_json(check)
             save_check(shared, check)
@@ -1851,7 +1860,7 @@ def main():
         return run_bot(parts)
     if args.status:
         result = fetch_stock(parts)
-        footer = check_counts_footer(10, recent_check_counts(), ("vps", "secondary", "github"))
+        footer = check_counts_footer(10, recent_check_counts(), ("vps", "secondary", "third", "github"))
         send_telegram(status_message(result, parts, footer))
         log("Status sent to Telegram.")
         return 0
