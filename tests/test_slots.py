@@ -166,8 +166,8 @@ class Shared(SharedBase):
         for msg in statuses:
             self.assertTrue(msg["disable_notification"])
             self.assertIn("🟢 В наличии · iPhone 18 Pro Max\n🖤 2TB · Black — 🛒 Оформить", check_html(msg["text"]))
-        self.assertTrue(statuses[0]["text"].endswith("🕐 Проверено: 03.10.2026 10:10 (HKT)\n🔁 Проверок за 10 мин: 19 — VPS 9, GitHub 10"))
-        self.assertTrue(statuses[1]["text"].endswith("🕐 Проверено: 03.10.2026 10:20 (HKT)\n🔁 Проверок за 10 мин: 20 — VPS 10, GitHub 10"))
+        self.assertTrue(statuses[0]["text"].endswith("🕐 Проверено: 03.10.2026 10:10 (HKT)\n🔁 Проверок за 10 мин: 19 — VPS 1 9, GitHub 10"))
+        self.assertTrue(statuses[1]["text"].endswith("🕐 Проверено: 03.10.2026 10:20 (HKT)\n🔁 Проверок за 10 мин: 20 — VPS 1 10, GitHub 10"))
 
     def test_github_silence_is_reported_once_and_so_is_its_return(self):
         self.github = lambda moment: None if hkt("10:05:00") < moment < hkt("10:50:00") else set()
@@ -532,7 +532,7 @@ class MainFills(SharedBase):
         self.clock.hooks.append(standby)
         self.run_until(hkt("10:45:10"), status_minutes=10)
         texts = self.texts()
-        self.assertTrue(texts[0].endswith("🔁 Проверок за 10 мин: 20 — VPS 9, GitHub 10, Запасной VPS 1"), texts[0])
+        self.assertTrue(texts[0].endswith("🔁 Проверок за 10 мин: 20 — VPS 1 9, GitHub 10, VPS 2 1"), texts[0])
         self.assertFalse([t for t in texts if t.startswith("⚠️")])  # a standby is meant to be quiet
         self.assertIn("Запасной VPS: 6 stores × 12 models checked", sys.stdout.getvalue())
 

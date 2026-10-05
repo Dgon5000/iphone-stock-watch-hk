@@ -86,6 +86,8 @@ INBOX_STALE_SECONDS = 300
 WORKING_WINDOW = timedelta(minutes=3)
 SOURCE_NAMES = {"vps": "VPS", "github": "GitHub", "mac": "Mac", "backup": "Запасной VPS",
                 "secondary": "Дополнительный VPS"}
+# Short server labels in Telegram's per-source check counts.
+COUNT_SOURCE_NAMES = {"vps": "VPS 1", "secondary": "VPS 2", "backup": "VPS 2"}
 # A standby server (--standby-of) asks the main server how it is at this many seconds past
 # every minute (--sync), keeping a copy of its stock. It stands in once the main server has
 # not been working for MAIN_SILENT_AFTER; back after a break that long, the main server
@@ -811,7 +813,7 @@ class Status:
             footer = f"🔁 Проверок за {minutes} мин: {sum(self.counts.values())}"
             shown = list(sources) + sorted(s for s in self.counts if s and s not in sources)  # a standby filling in
             if len(shown) > 1:
-                footer += " — " + ", ".join(f"{source_name(s)} {self.counts[s]}" for s in shown)
+                footer += " — " + ", ".join(f"{COUNT_SOURCE_NAMES.get(s, source_name(s))} {self.counts[s]}" for s in shown)
             message = status_message(result, parts, footer)
             if dry_run:
                 print(f"--- dry run, status not sent ---\n{message}\n---", flush=True)
