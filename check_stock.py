@@ -561,32 +561,17 @@ def change_message(appeared, sold_out, parts, moment=None):
     return "\n\n".join(blocks)
 
 
-def unavailable_summary(missing, watched):
-    """One out-of-stock configuration per line, in watch-list order."""
-    several_models = len({describe(item["product"])[0] for item in watched}) > 1
-    pieces = []
-    for item in missing:
-        model, storage, color = describe(item["product"])
-        name = escape(f"{model} {storage}".strip() if several_models or not storage else storage)
-        variant = f"{color_emoji(color)} {name}" + (f" · {escape(color)}" if color else "")
-        pieces.append(f"• {variant}")
-    return "\n".join(pieces)
-
-
 def status_message(result, parts, footer=None):
-    """Everything watched: what is in stock now (with links), then unavailable variants.
+    """The configurations currently in stock (with links), without an unavailable list.
     `footer` goes under the check time."""
     in_stock = {item["partNumber"] for item in result.available}
     watched = [{"partNumber": p, "product": result.products[p]} for p in parts if p in result.products]
     available = [item for item in watched if item["partNumber"] in in_stock]
-    missing = [item for item in watched if item["partNumber"] not in in_stock]
     blocks = ["📋 Наличие в Apple Store Hong Kong"]
     if available:
         blocks += config_blocks(available, checkout_link, "🟢 В наличии ·")
     else:
         blocks.append("Сейчас ничего из отслеживаемого нет в наличии.")
-    if missing:
-        blocks.append(f"➖ Нет в наличии:\n{unavailable_summary(missing, watched)}")
     blocks.append(checked_at(result.checked_at) + (f"\n{footer}" if footer else ""))
     return "\n\n".join(blocks)
 
@@ -822,8 +807,8 @@ def recent_check_counts(minutes=10, now=None):
 
 class Status:
     """A quiet summary of everything watched every `minutes` minutes on the clock (10:00,
-    10:10, …): sent with the first check of a new period that reported no change, with how
-    many checks there were since the last one (or since the start)."""
+    10:10, …): sent with the first fresh check of a new period, even if stock changed.
+    A failed delivery is retried with the next fresh check, keeping the check counts."""
 
     def __init__(self, minutes):
         self.minutes = minutes
@@ -839,20 +824,23 @@ class Status:
         period = int(moment.timestamp() // (self.minutes * 60))
         if self.period is None:
             self.period, self.since = period, moment
-        if period != self.period and not reported:
+        if period != self.period:
             minutes = max(1, round((moment - self.since).total_seconds() / 60))
             footer = check_counts_footer(minutes, self.counts, sources)
             message = status_message(result, parts, footer)
+            delivered = dry_run
             if dry_run:
                 print(f"--- dry run, status not sent ---\n{message}\n---", flush=True)
             else:
                 try:
                     send_telegram(message, silent=True)
+                    delivered = True
                     log("Status sent to Telegram.")
                 except Exception as exc:
                     log(f"ERROR: could not send the status: {exc}", error=True)
-            self.period, self.since = period, moment
-            self.counts.clear()
+            if delivered:
+                self.period, self.since = period, moment
+                self.counts.clear()
         self.counts[source] += 1
 
 

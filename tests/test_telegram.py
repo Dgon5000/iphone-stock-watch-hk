@@ -471,9 +471,8 @@ class AlertScenarios(Base):
                 "📋 Наличие в Apple Store Hong Kong", "",
                 "🟢 В наличии · iPhone 18 Pro Max", "🩶 2TB · Silver — 🛒 Оформить", "🖤 2TB · Black — 🛒 Оформить",
             ])
-            self.assertEqual(lines[6:9], ["➖ Нет в наличии:", "• 🩶 512GB · Silver", "• 🖤 512GB · Black"])
-            self.assertEqual(lines[-2:], ["• 🩵 2TB · Glacier", "• ❤️ 2TB · Burgundy"])
-            self.assertEqual(len(lines[7:]), 10)  # each missing configuration has its own line
+            self.assertEqual(len(lines), 5)
+            self.assertNotIn("Нет в наличии", msg["text"])
         self.assertFalse(self.world.sent()[0]["disable_notification"])  # change alerts keep their sound
 
     def test_status_with_pauses_of_1_2_3_minutes(self):
@@ -490,9 +489,9 @@ class AlertScenarios(Base):
             self.assertTrue(msg["disable_notification"])
             self.assertIn("📋 Наличие в Apple Store Hong Kong", msg["text"])
 
-    def test_status_waits_for_a_check_without_changes(self):
+    def test_status_is_sent_in_the_new_period_even_when_stock_changes(self):
         w = self.world
-        # the check at 10:12 brings new stock: the status comes with the next check, at 10:17
+        # The check at 10:12 brings new stock and still produces the scheduled full status.
         w.stock_sequence = [set(), set(), set(), {("R409", "MJXU4ZA/A")}, {("R409", "MJXU4ZA/A")}]
         self.watch(sleeps_before_stop=5)  # checks at 10:00, 10:05, 10:08, 10:12, 10:17
         texts = [check_html(m["text"]) for m in w.sent()]
@@ -500,7 +499,22 @@ class AlertScenarios(Base):
         self.assertIn("🟢 Появились", texts[0])
         self.assertIn("🕐 Проверено: 03.10.2026 10:12 (HKT)", texts[0])
         self.assertTrue(texts[1].startswith("📋 Наличие в Apple Store Hong Kong"), texts[1])
-        self.assertIn("🕐 Проверено: 03.10.2026 10:17 (HKT)\n🔁 Проверок за 17 мин: 4", texts[1])
+        self.assertIn("🕐 Проверено: 03.10.2026 10:12 (HKT)\n🔁 Проверок за 12 мин: 3", texts[1])
+
+    def test_failed_status_is_retried_with_the_next_fresh_check(self):
+        status = self.cs.Status(10)
+        result = self.cs.CheckResult(6, dict(CATALOG), [], [], datetime(2026, 10, 3, 2, 0, tzinfo=timezone.utc))
+        status.after_check(result, list(PRO_MAX), False, False, 'vps', ('vps', 'github'))
+        self.world.telegram_errors = [(502, 'Bad Gateway', None)]
+        result.checked_at += timedelta(minutes=10)
+        status.after_check(result, list(PRO_MAX), False, False, 'github', ('vps', 'github'))
+        self.assertEqual(status.counts, {'vps': 1, 'github': 1})
+        result.checked_at += timedelta(seconds=15)
+        status.after_check(result, list(PRO_MAX), False, False, 'vps', ('vps', 'github'))
+        successful = self.world.sent()[-1]['text']
+        self.assertIn('🔁 Проверок за 10 мин: 2', successful)
+        self.assertIn('• <b>VPS 1</b> — 1\n• <b>GitHub</b> — 1', successful)
+        self.assertEqual(status.counts, {'vps': 1})
 
     def test_status_can_be_switched_off(self):
         self.watch(sleeps_before_stop=7, status_minutes=0)
@@ -528,11 +542,7 @@ class AlertScenarios(Base):
         self.assertFalse(msg["disable_notification"])
         self.assertEqual(
             body(msg["text"]),
-            "📋 Наличие в Apple Store Hong Kong\n\nСейчас ничего из отслеживаемого нет в наличии.\n\n"
-            "➖ Нет в наличии:\n" + "\n".join(
-                f"• {emoji} {storage} · {color}"
-                for storage in ('512GB', '1TB', '2TB')
-                for emoji, color in (('🩶', 'Silver'), ('🖤', 'Black'), ('🩵', 'Glacier'), ('❤️', 'Burgundy'))),
+            "📋 Наличие в Apple Store Hong Kong\n\nСейчас ничего из отслеживаемого нет в наличии.",
         )
         self.assertIsNone(self.state())
 

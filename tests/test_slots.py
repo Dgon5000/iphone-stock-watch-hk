@@ -312,6 +312,27 @@ class Ingest(FakeClockBase):
                 self.cs.check_from_json(broken)
 
 
+class RefusalProtection(FakeClockBase):
+    def test_repeated_refusals_increase_the_pause_cap_it_and_reset_after_success(self):
+        for code in (403, 429, 541):
+            with self.subTest(code=code):
+                backoff = self.cs.Backoff()
+                self.world.apple_errors = [HTTPError('u', code, '', {}, io.BytesIO(b'')) for _ in range(5)]
+                for pause in (120, 240, 480, 900, 900):
+                    result, error = backoff.look(list(PRO_MAX))
+                    self.assertIsNone(result)
+                    self.assertEqual(error.code, code)
+                    self.assertEqual(backoff.until - self.clock.now, pause)
+                    self.assertFalse(backoff.allows(self.clock.now + pause - 1))
+                    self.clock.now = backoff.until
+                    self.assertTrue(backoff.allows(self.clock.now))
+                result, error = backoff.look(list(PRO_MAX))
+                self.assertIsNotNone(result)
+                self.assertIsNone(error)
+                self.assertEqual((backoff.refusals, backoff.until), (0, 0.0))
+        self.assertIsNone(self.state())  # refusals alone do not change availability
+
+
 class ProbeBase(FakeClockBase):
     def setUp(self):
         super().setUp()
