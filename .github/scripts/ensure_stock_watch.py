@@ -4,7 +4,8 @@ import json
 import os
 import subprocess
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+import math
 
 WORKFLOW_PATH = ".github/workflows/stock-watch.yml"
 MIN_START_INTERVAL = 600  # a broken setup must not create a rapid restart loop
@@ -26,9 +27,14 @@ def ensure_running(repo, now=None):
         print("Stock Watch has an active or queued run; no additional run is needed.")
         return 0
     starts = [datetime.fromisoformat(r["created_at"].replace("Z", "+00:00")) for r in runs]
-    if starts and (now - max(starts)).total_seconds() < MIN_START_INTERVAL:
-        print("The last run started less than 10 minutes ago; the scheduled watchdog will retry.")
-        return 0
+    if starts:
+        wait = math.ceil(MIN_START_INTERVAL - (now - max(starts)).total_seconds())
+        if wait > 0:
+            print(f"The last run started recently; retrying in {wait} seconds.", flush=True)
+            time.sleep(wait)
+            # Re-read both workflow state and runs: someone may have started or disabled
+            # the watcher while we waited. Recovery does not depend on a later cron event.
+            return ensure_running(repo, now + timedelta(seconds=wait))
     for attempt in range(3):
         try:
             gh("workflow", "run", "stock-watch.yml", "--repo", repo, "--ref", "main")

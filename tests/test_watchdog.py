@@ -59,13 +59,25 @@ class Recovery(unittest.TestCase):
                 self.assertEqual(self.ensure(), 0)
         self.assertEqual(self.dispatches, [('workflow', 'run', 'stock-watch.yml', '--repo', 'owner/repo', '--ref', 'main')] * 4)
 
-    def test_quick_failures_are_throttled_until_ten_minutes_since_start(self):
+    def test_quick_failure_waits_then_recovers_without_a_cron_event(self):
         self.runs = [self.completed('failure', age=599)]
         self.ensure()
-        self.assertEqual(self.dispatches, [])
-        self.runs = [self.completed('failure', age=600)]
-        self.ensure()
+        self.assertEqual(self.sleeps, [1])
         self.assertEqual(len(self.dispatches), 1)
+
+    def test_rechecks_for_a_new_run_after_waiting(self):
+        self.runs = [self.completed('failure', age=60)]
+
+        def sleep(seconds):
+            self.sleeps.append(seconds)
+            self.runs.insert(0, {'status': 'queued'})
+
+        with mock.patch.object(watchdog, 'gh', self.gh), \
+             mock.patch.object(watchdog.time, 'sleep', sleep), \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(watchdog.ensure_running('owner/repo', self.now), 0)
+        self.assertEqual(self.sleeps, [540])
+        self.assertEqual(self.dispatches, [])
 
     def test_disabled_or_missing_workflow_is_not_restarted(self):
         self.workflows[0]['state'] = 'disabled_manually'
