@@ -40,7 +40,7 @@ jobs:
         shell: bash
         run: |
           if [ -z "$FEED_SSH_KEY" ] || [ -z "$FEED_HOST" ] || [ -z "$FEED_KNOWN_HOSTS" ]; then
-            echo "::error::The secrets FEED_SSH_KEY, FEED_HOST and FEED_KNOWN_HOSTS are needed (see README)."
+            echo "::error::The secrets FEED_SSH_KEY, FEED_HOST and FEED_KNOWN_HOSTS are needed."
             exit 1
           fi
           install -d -m 700 ~/.ssh
