@@ -1,17 +1,18 @@
 #!/bin/bash
 # Install the Apple Store Hong Kong stock watch on a Linux server with systemd
-# (Ubuntu, Debian and similar) as a service that checks at :00 of every minute and sends a
+# (Ubuntu, Debian and similar) as a service that checks at :40 of every minute and sends a
 # quiet status every 10 minutes, plus a second service that answers /iphone and /report in
-# Telegram. GitHub may check at :30 and hand its checks in over SSH (see feed-key): one
-# state for both, so a check every 30 seconds and still one alert per change.
-# A second server can stand by (see standby): it checks only while this one does not work.
+# Telegram. GitHub checks at :00 and a participating standby at :20, handing results to
+# the main server over SSH: one state and one alert per change, with checks every 20 seconds.
+# The second server also takes over if the main watcher stops working.
 # The services start again after reboots or crashes.
 #
 #   sudo bash vps_install.sh             install or update (asks for the Telegram token on the first run)
-#   sudo EVERY=60 OFFSET=0 STATUS_MINUTES=10 bash vps_install.sh   other check times (seconds) and status period (minutes, 0 = none)
+#   sudo EVERY=60 OFFSET=40 STATUS_MINUTES=10 bash vps_install.sh   other check times (seconds) and status period (minutes, 0 = none)
 #   sudo bash vps_install.sh feed-key 'ssh-ed25519 AAAA… github'   let GitHub hand in its checks with this SSH key
 #   sudo bash vps_install.sh standby MAIN_IP    make this server the standby of the main one (prints its key);
 #                                               MAIN_HOST_KEY='ssh-ed25519 AAAA…' gives the main server's host key
+#                                               PARTICIPATE=0 keeps the legacy passive standby mode
 #   sudo bash vps_install.sh sync-key 'ssh-ed25519 AAAA… standby'  on the main server: let the standby ask how it is
 #   sudo bash vps_install.sh status      send what is in stock now to Telegram
 #   sudo bash vps_install.sh report      when which configuration was in stock (history report)
@@ -24,7 +25,8 @@ set -euo pipefail
 APP="${APP:-/opt/iphone-stock-watch-hk}"
 UNIT_DIR="${UNIT_DIR:-/etc/systemd/system}"
 EVERY="${EVERY:-60}"
-OFFSET="${OFFSET:-0}"
+OFFSET="${OFFSET:-}"
+PARTICIPATE="${PARTICIPATE:-1}"
 STATUS_MINUTES="${STATUS_MINUTES:-10}"
 NAME="iphone-stock-watch-hk"
 RUN_USER="stockwatch"
@@ -132,6 +134,13 @@ case "${1:-}" in
     ;;
 esac
 
+if [ -z "$OFFSET" ]; then
+  if [ "$ROLE" = standby ]; then OFFSET=20; else OFFSET=40; fi
+fi
+if ! [[ "$PARTICIPATE" =~ ^[01]$ ]]; then
+  echo "PARTICIPATE — 1 (дополнительный сервер проверяет постоянно) или 0 (только резервирование)." >&2
+  exit 1
+fi
 if ! [[ "$EVERY" =~ ^[0-9]+$ && "$OFFSET" =~ ^[0-9]+$ && "$STATUS_MINUTES" =~ ^[0-9]+$ ]] \
     || [ "$EVERY" -lt 10 ] || [ "$OFFSET" -ge "$EVERY" ]; then
   echo "EVERY — секунды между проверками (не меньше 10), OFFSET — сдвиг в секундах (меньше EVERY), STATUS_MINUTES — минуты между сводками (0 — без сводок)." >&2
@@ -237,6 +246,9 @@ EOF
   chmod 600 "$APP/.ssh/sync_key" "$APP/.ssh/config"
   chmod 644 "$APP/.ssh/sync_key.pub" "$APP/.ssh/known_hosts"
   WATCH="--watch --every $EVERY --offset $OFFSET --status-minutes $STATUS_MINUTES --inbox $INBOX --source backup --standby-of main"
+  if [ "$PARTICIPATE" = 1 ]; then
+    WATCH="--watch --every $EVERY --offset $OFFSET --status-minutes $STATUS_MINUTES --inbox $INBOX --source secondary --standby-of main --participate"
+  fi
 else
   WATCH="--watch --every $EVERY --offset $OFFSET --status-minutes $STATUS_MINUTES --inbox $INBOX"
 fi
@@ -299,7 +311,11 @@ systemctl enable --now "${UNITS[@]}"
 sleep 5
 journalctl -u "$NAME.service" -u "$NAME-bot.service" -n 6 --no-pager -o cat || true
 if [ "$ROLE" = standby ]; then
-  echo "Готово: запасной сервер для $MAIN_HOST. Пока основной работает, он не проверяет; если основной не работает 3 мин — проверяет сам каждые $EVERY с."
+  if [ "$PARTICIPATE" = 1 ]; then
+    echo "Готово: дополнительный сервер проверяет каждые $EVERY с (сдвиг $OFFSET с) и передаёт результаты $MAIN_HOST; при сбое основного на 3 мин сам отправляет уведомления."
+  else
+    echo "Готово: запасной сервер для $MAIN_HOST; проверяет сам, если основной не работает 3 мин."
+  fi
   if runuser -u "$RUN_USER" -- ssh -F "$APP/.ssh/config" -T main < /dev/null > /dev/null 2>&1; then
     echo "Связь с основным сервером есть."
   else

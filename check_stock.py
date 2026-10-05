@@ -5,10 +5,11 @@ Checks in-store pickup availability of the watched iPhone part numbers at every
 Apple Store in Hong Kong and sends one Telegram alert when a configuration comes
 into stock at any of them.
 
-Two computers can share the checks: the server checks at :00 of every minute
-(--watch --every 60 --inbox DIR) and GitHub at :30 (--probe), handing each answer
-to the server over SSH (--ingest). Only the server decides what to send, so nothing
-arrives twice, and it keeps the history of both.
+Three computers share the checks: GitHub at :00 (--probe), a participating standby
+at :20 (--watch --standby-of HOST --participate), and the main server at :40 of every
+minute (--watch --every 60 --offset 40 --inbox DIR). Both remote computers hand their
+answers to the main server over SSH. Only the main server sends stock alerts and keeps
+the combined history while it is healthy; the standby takes over during an outage.
 """
 import argparse
 import itertools
@@ -83,7 +84,8 @@ MAX_CHECK_BYTES = 64 * 1024
 INBOX_LIMIT = 500
 INBOX_STALE_SECONDS = 300
 WORKING_WINDOW = timedelta(minutes=3)
-SOURCE_NAMES = {"vps": "VPS", "github": "GitHub", "mac": "Mac", "backup": "Запасной VPS"}
+SOURCE_NAMES = {"vps": "VPS", "github": "GitHub", "mac": "Mac", "backup": "Запасной VPS",
+                "secondary": "Дополнительный VPS"}
 # A standby server (--standby-of) asks the main server how it is at this many seconds past
 # every minute (--sync), keeping a copy of its stock. It stands in once the main server has
 # not been working for MAIN_SILENT_AFTER; back after a break that long, the main server
@@ -1047,7 +1049,7 @@ class Watcher:
 
     def note(self, source, moment, result, error):
         """How each computer's checks go, for fills(). A standby's own are not its business."""
-        if source == "backup":
+        if source in ("backup", "secondary"):
             return
         failed = result is None
         self.unreachable[source] = self.unreachable[source] + 1 if failed and unreachable(error) else 0
@@ -1139,18 +1141,40 @@ class Standby(Watcher):
     itself, also handling GitHub's checks (which then come here); when the main server works
     again it hands back its stock and its checks and stands aside.
     While the main server works, it also checks in place of a computer the main server asks
-    for (see FILL_AFTER), and passes on GitHub's checks that could not reach the main server."""
+    for (see FILL_AFTER), and passes on GitHub's checks that could not reach the main server.
+    With --participate it also makes regular checks in its own slot, handing them to the
+    main server without sending Telegram alerts until it needs to stand in."""
 
-    def __init__(self, parts, dry_run, status_minutes, source, main):
+    def __init__(self, parts, dry_run, status_minutes, source, main, participate=False, inbox=None):
         super().__init__(parts, dry_run, status_minutes, source)
         self.main = main
+        self.participate = participate
+        self.inbox = Path(inbox) if inbox else None
         self.active = False
         self.down_since = None
         self.history = []  # checks made while standing in, for the main server's history
         self.fill = {}  # second of the minute -> the computer to check in place of
 
     def checking(self):
-        return self.active
+        return self.active or self.participate
+
+    def handle(self, source, moment, result=None, error=None):
+        if self.active:
+            return super().handle(source, moment, result, error)
+        log(f"{source_name(source)}: " + (summary(result, self.parts) if result else f"ERROR: {error}"))
+        if self.dry_run:
+            return
+        data = check_to_json(source, result, error, moment)
+        if self.down_since is None:
+            _, problem = exchange(self.main, {"check": data})
+            if problem is None:
+                return
+            log(f"ERROR: could not hand the check to the main server: {problem}; keeping it in the inbox.", error=True)
+            self.down_since = utc_now()
+        try:
+            save_check(self.inbox, data)
+        except (OSError, ValueError) as exc:
+            log(f"ERROR: could not keep the check: {exc}", error=True)
 
     def record(self, result, error, source, moment):
         lines = super().record(result, error, source, moment)
@@ -1160,19 +1184,23 @@ class Standby(Watcher):
     def take_inbox(self, inbox):
         if self.active:
             return super().take_inbox(inbox)
+        if self.down_since is not None:
+            return  # keep checks until the next successful sync, or until we stand in
         # GitHub could not reach the main server: pass its checks on, if the main server works.
         for path in sorted(Path(inbox).glob("*.json")):
             try:
                 data = json.loads(path.read_text(encoding="utf-8"))
             except (OSError, ValueError):
                 data = None
-            remove(path)
-            if data is not None and self.down_since is None:
+            if data is not None:
                 _, problem = exchange(self.main, {"check": data})
                 if problem:
-                    log(f"ERROR: could not pass GitHub's check on to the main server: {problem}", error=True)
+                    log(f"ERROR: could not pass a check on to the main server: {problem}", error=True)
+                    self.down_since = utc_now()
+                    break  # do not discard checks or retry SSH on every loop iteration
                 else:
-                    log("Passed GitHub's check on to the main server.")
+                    log("Passed a check on to the main server.")
+            remove(path)
 
     def next_fill(self, now):
         """When to check next in place of another computer (math.inf: not asked to)."""
@@ -1211,7 +1239,8 @@ class Standby(Watcher):
                 self.active = False
                 log("The main server works again: handed back the stock; standing aside.")
                 if not self.dry_run:
-                    tell("✅ Основной сервер снова проверяет. Запасной вернулся в режим ожидания.")
+                    behavior = "Дополнительный сервер снова передаёт ему свои проверки." if self.participate else "Запасной вернулся в режим ожидания."
+                    tell(f"✅ Основной сервер снова проверяет. {behavior}")
             elif not self.dry_run:
                 try:
                     self.state["available"] = stock_from_json(reply.get("available"))
@@ -1260,13 +1289,14 @@ def fill_from_json(items):
     return fill
 
 
-def run_slots(parts, every, offset, dry_run, status_minutes=0, inbox=None, source="vps", standby_of=None):
+def run_slots(parts, every, offset, dry_run, status_minutes=0, inbox=None, source="vps", standby_of=None,
+              participate=False):
     """Check at fixed times on the clock, `offset` seconds past every multiple of `every`
     seconds (60 and 0: at :00 of every minute), and in between handle the checks other
-    computers hand in through `inbox` (GitHub's at :30). With `standby_of` (an ssh host) this
+    computers hand in through `inbox`. With `standby_of` (an ssh host) this
     is a standby for that main server (see Standby). Runs until stopped."""
     if standby_of:
-        watcher = Standby(parts, dry_run, status_minutes, source, standby_of)
+        watcher = Standby(parts, dry_run, status_minutes, source, standby_of, participate, inbox)
         sync_due = next_slot(time.time(), 60, SYNC_OFFSET)
     else:
         watcher = Watcher(parts, dry_run, status_minutes, source, shared=inbox, offset=offset)
@@ -1509,7 +1539,7 @@ def sync(shared, stream, out):
             write_shared(shared / f"history-{time.time_ns()}.sync", history_from_json(data["history"]))
         if "check" in data:  # the standby's check in place of another computer, or GitHub's passed on
             check = data["check"]
-            if not isinstance(check, dict) or check.get("source") not in ("backup", "github"):
+            if not isinstance(check, dict) or check.get("source") not in ("backup", "secondary", "github"):
                 raise ValueError("bad check")
             check_from_json(check)
             save_check(shared, check)
@@ -1526,7 +1556,7 @@ def sync(shared, stream, out):
 
 
 def run_probe(parts, feed, every, offset, minutes=0, source="github", backup=None):
-    """--probe: check at fixed times on the clock like run_slots (GitHub: at :30, between the
+    """--probe: check at fixed times on the clock like run_slots (GitHub: at :00, between the
     server's checks) and hand every answer to the server with deliver(); the server decides
     what to send. A check the server does not take goes to the standby server (`backup`).
     Stops after `minutes` (0: never). Tells Telegram once if neither has taken the checks for
@@ -1775,12 +1805,15 @@ def main():
     parser.add_argument("--minutes", type=int, default=0, metavar="N", help="with --probe: stop after N minutes (default: never)")
     parser.add_argument("--ingest", metavar="DIR", help="save the checks sent on stdin into DIR for --watch --inbox (the server's SSH command)")
     parser.add_argument("--standby-of", metavar="HOST", help="with --watch --every: stand by for the main server (`ssh HOST` runs --sync there) and check only while it does not work")
+    parser.add_argument("--participate", action="store_true", help="with --standby-of and --inbox: also check in this server's own slot while the main server works; hand it the results")
     parser.add_argument("--sync", metavar="DIR", help="answer a standby: keep what it hands back in DIR, print this server's status (the server's SSH command)")
     parser.add_argument("--dry-run", action="store_true", help="print alerts instead of sending them; keep the state file")
     parser.add_argument("--test-telegram", action="store_true", help="send a test Telegram message and exit")
     parser.add_argument("--status", action="store_true", help="send what is in stock now to Telegram and exit")
     parser.add_argument("--bot", action="store_true", help="answer the /iphone command in Telegram (runs until stopped)")
     args = parser.parse_args()
+    if args.participate and not (args.standby_of and args.inbox and args.watch is not None and args.every is not None):
+        parser.error("--participate needs --watch --every --standby-of and --inbox")
 
     if args.ingest:
         return ingest(args.ingest, args.source or "github", sys.stdin.buffer)
@@ -1812,11 +1845,14 @@ def main():
         status = f"a quiet status every {args.status_minutes} min." if args.status_minutes else "no status messages."
         if args.every is not None:
             inbox = f" plus the checks handed in through {args.inbox}" if args.inbox else ""
-            role = f" Standing by for the main server (ssh {args.standby_of}): checking only while it does not work." if args.standby_of else ""
+            role = ""
+            if args.standby_of:
+                behavior = "checking in this slot and forwarding results; taking over if it stops working" if args.participate else "checking only while it does not work"
+                role = f" Standing by for the main server (ssh {args.standby_of}): {behavior}."
             log(f"Watching {len(parts)} configurations: a check every {args.every} s, {args.offset} s past the clock"
                 f"{inbox}; {status}{role}")
-            source = args.source or ("backup" if args.standby_of else "vps")
-            return run_slots(parts, args.every, args.offset, args.dry_run, args.status_minutes, args.inbox, source, args.standby_of)
+            source = args.source or ("secondary" if args.participate else "backup" if args.standby_of else "vps")
+            return run_slots(parts, args.every, args.offset, args.dry_run, args.status_minutes, args.inbox, source, args.standby_of, args.participate)
         if args.standby_of:
             parser.error("--standby-of needs --watch --every")
         pauses = parse_schedule(args.watch or os.environ.get("CHECK_SCHEDULE_MINUTES") or DEFAULT_SCHEDULE)
