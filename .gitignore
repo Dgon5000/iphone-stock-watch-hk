@@ -4,3 +4,5 @@ __pycache__/
 stock_history.jsonl
 apple_backoff.json
 *.csv
+# Server addresses, logins and keys: on the owner's computer only (the repository is public)
+DEPLOYMENT.local.md

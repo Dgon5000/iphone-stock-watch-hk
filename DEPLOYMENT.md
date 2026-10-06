@@ -12,11 +12,11 @@ Unix-времени. Первый слот чередуется между :00 �
 | Сдвиг в цикле | Участник | Режим |
 | --- | --- | --- |
 | `0 с` | GitHub Actions | `--probe feed --every 90 --offset 0 --minutes 330` |
-| `15 с` | VPS 2, `VPS2_IP` | `--watch --every 90 --offset 15 --source secondary --standby-of main --participate` |
-| `30 с` | VPS 1, `VPS1_IP` | `--watch --every 90 --offset 30` |
-| `45 с` | VPS 3, `VPS3_IP` | `--probe feed --backup feed2 --every 90 --offset 45 --source third` |
-| `60 с` | VPS 4, `VPS4_IP` | `--probe feed --backup feed2 --every 90 --offset 60 --source fourth` |
-| `75 с` | VPS 5, `VPS5_IP` | `--probe feed --backup feed2 --every 90 --offset 75 --source fifth` |
+| `15 с` | VPS 2 | `--watch --every 90 --offset 15 --source secondary --standby-of main --participate` |
+| `30 с` | VPS 1 | `--watch --every 90 --offset 30` |
+| `45 с` | VPS 3 | `--probe feed --backup feed2 --every 90 --offset 45 --source third` |
+| `60 с` | VPS 4 | `--probe feed --backup feed2 --every 90 --offset 60 --source fourth` |
+| `75 с` | VPS 5 | `--probe feed --backup feed2 --every 90 --offset 75 --source fifth` |
 
 VPS 1 и VPS 2 используют `--inbox /var/spool/iphone-stock-watch-hk`. Основной VPS
 обрабатывает результаты всех шести участников, ведёт историю и отправляет
@@ -69,8 +69,8 @@ VPS 3, VPS 4 и VPS 5 работают только как проверяющи�
 VPS 2 остаётся единственным резервным отправителем уведомлений.
 
 На новом VPS установку выполняет `vps_probe_install.sh`. Для настройки требуются
-проверенные `MAIN_HOST_KEY` и `BACKUP_HOST_KEY`; эти публичные ключи получаются
-с уже доступных серверов. `SOURCE=third`, `fourth` или `fifth` выбирает узел и
+адреса `MAIN_HOST` и `BACKUP_HOST` (VPS 1 и VPS 2) и проверенные `MAIN_HOST_KEY` и
+`BACKUP_HOST_KEY`; эти публичные ключи получаются с уже доступных серверов. `SOURCE=third`, `fourth` или `fifth` выбирает узел и
 его сдвиг 45, 60 или 75 с. `START_SERVICE=0` готовит службу и её публичный ключ
 без запуска запросов. Этот ключ нужно добавить на обоих получателях через
 `vps_install.sh probe-key 'ssh-ed25519 … vps4' fourth` или эквивалентную установку
@@ -81,18 +81,9 @@ VPS 3 хранится как `probe_key.pub`, новые — `probe_fourth_key.
 
 ## Доступ для обслуживания
 
-SSH-логин на VPS 1, VPS 2, VPS 4 и VPS 5 — `root`, на VPS 3 — `VPS3_USER` с доступом через
-`sudo -n`. Порт на всех VPS — `22`. Отдельный ключ на компьютере владельца:
-`~/.ssh/ADMIN_KEY`. Он не хранится в репозитории или GitHub Secrets.
-Публичный ключ имеет комментарий `ADMIN_KEY_COMMENT`; прежние ключи сохранены.
-
-```sh
-ssh -i ~/.ssh/ADMIN_KEY -o IdentitiesOnly=yes root@VPS1_IP
-ssh -i ~/.ssh/ADMIN_KEY -o IdentitiesOnly=yes root@VPS2_IP
-ssh -i ~/.ssh/ADMIN_KEY -o IdentitiesOnly=yes VPS3_USER@VPS3_IP
-ssh -i ~/.ssh/ADMIN_KEY -o IdentitiesOnly=yes root@VPS4_IP
-ssh -i ~/.ssh/ADMIN_KEY -o IdentitiesOnly=yes root@VPS5_IP
-```
+Адреса серверов, SSH-логины и ключ администратора записаны в `DEPLOYMENT.local.md`
+рядом с этим файлом, только на компьютере владельца. Репозиторий публичный: этот файл
+указан в `.gitignore`, а адреса, логины, ключи и токены в репозиторий не добавляются.
 
 Для GitHub используется существующая авторизация `gh` аккаунта `Dgon5000`.
 Секреты `FEED_HOST`, `FEED_HOST_BACKUP`, `FEED_SSH_KEY`, `FEED_KNOWN_HOSTS`,
@@ -105,7 +96,7 @@ ssh -i ~/.ssh/ADMIN_KEY -o IdentitiesOnly=yes root@VPS5_IP
 - `/opt/iphone-stock-watch-hk/check_stock.py` — программа службы;
 - `/usr/local/lib/iphone-stock-watch-hk/check_stock.py` — копия для ограниченных SSH-команд;
 - `/etc/systemd/system/iphone-stock-watch-hk.service` — расписание службы;
-- при добавлении ключа — только новая строка `ADMIN_KEY_COMMENT` в `/root/.ssh/authorized_keys`.
+- при добавлении ключа администратора — только новая строка в `/root/.ssh/authorized_keys`.
 
 При обновлении существующей установки бот, секреты, история, состояние и ключи
 обмена остаются на месте. Переустанавливать службу через `vps_install.sh` для

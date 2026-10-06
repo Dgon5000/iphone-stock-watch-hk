@@ -1,13 +1,14 @@
 #!/bin/bash
 # Install VPS 3, 4 or 5 as a checking-only service. It sends results to VPS 1 or VPS 2;
 # it never takes over Telegram polling or stock alerts.
-# Supply verified MAIN_HOST_KEY and BACKUP_HOST_KEY (ssh-ed25519 public host keys).
+# Supply MAIN_HOST and BACKUP_HOST (the addresses of VPS 1 and VPS 2, kept out of this public
+# repository) and verified MAIN_HOST_KEY and BACKUP_HOST_KEY (ssh-ed25519 public host keys).
 set -euo pipefail
 
 APP="${APP:-/opt/iphone-stock-watch-hk}"
 UNIT_DIR="${UNIT_DIR:-/etc/systemd/system}"
-MAIN_HOST="${MAIN_HOST:-VPS1_IP}"
-BACKUP_HOST="${BACKUP_HOST:-VPS2_IP}"
+MAIN_HOST="${MAIN_HOST:-}"
+BACKUP_HOST="${BACKUP_HOST:-}"
 EVERY="${EVERY:-90}"
 SOURCE="${SOURCE:-third}"
 case "$SOURCE" in

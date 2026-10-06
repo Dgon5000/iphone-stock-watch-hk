@@ -1356,8 +1356,22 @@ class Installer(unittest.TestCase):
 
     def probe_install(self, **env):
         return subprocess.run(['bash', str(self.src / 'vps_probe_install.sh')],
-                              env={**self.env, 'MAIN_HOST_KEY': self.MAIN_KEY, 'BACKUP_HOST_KEY': self.MAIN_KEY,
+                              env={**self.env, 'MAIN_HOST': '198.51.100.7', 'BACKUP_HOST': '198.51.100.8',
+                                   'MAIN_HOST_KEY': self.MAIN_KEY, 'BACKUP_HOST_KEY': self.MAIN_KEY,
                                    'START_SERVICE': '0', **env}, capture_output=True, text=True, timeout=60)
+
+    def test_probe_installer_needs_both_server_addresses(self):
+        for missing in ('MAIN_HOST', 'BACKUP_HOST'):
+            with self.subTest(missing=missing):
+                done = self.probe_install(**{missing: ''})
+                self.assertEqual(done.returncode, 1)
+                self.assertIn('Нужны адреса', done.stderr)
+                self.assertFalse((self.units / 'iphone-stock-watch-hk.service').exists())
+        done = self.probe_install()
+        self.assertEqual(done.returncode, 0, done.stderr)
+        config = (self.app / '.ssh/config').read_text()
+        self.assertIn('HostName 198.51.100.7', config)
+        self.assertIn('HostName 198.51.100.8', config)
 
     def test_vps3_installer_has_no_telegram_credentials_or_bot(self):
         (self.app / 'config.env').unlink()
