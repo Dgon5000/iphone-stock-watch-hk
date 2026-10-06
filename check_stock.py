@@ -22,6 +22,7 @@ import re
 import ssl
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from collections import Counter
@@ -74,6 +75,10 @@ DEFAULT_SCHEDULE = "1,2,3"
 DEFAULT_STATUS_MINUTES = 10
 # A request that fails on the network (timeout, reset) is tried once more after this pause.
 NETWORK_RETRY_SECONDS = 5
+# --watch --every waits this long for its own answer from Apple (usually 1–2 s). A slower
+# answer (it can take over a minute) is awaited in the background while the checks the other
+# computers hand in are handled (see OwnCheck).
+OWN_ANSWER_WAIT = 5
 # When Apple refuses requests (HTTP 403, 429, or 541 — Apple's own "too many requests from
 # this address"), the computer pauses its checks for 2, 4, 8 and then at most 15 minutes
 # instead of insisting.
@@ -922,6 +927,36 @@ class Backoff:
         return result, None
 
 
+class OwnCheck:
+    """This computer's own Backoff.look on a thread of its own, waited for OWN_ANSWER_WAIT.
+    When Apple takes longer, run_slots goes on handling the checks the other computers hand
+    in, as they come, instead of holding them back until Apple answers and then putting them
+    into the history only, as older than that answer."""
+
+    def __init__(self, backoff, parts):
+        self.answer, self.failure = (None, None), None
+        self.finished = threading.Event()
+        threading.Thread(target=self.ask, args=(backoff, parts), daemon=True).start()
+        self.finished.wait(OWN_ANSWER_WAIT)
+
+    def ask(self, backoff, parts):
+        try:
+            self.answer = backoff.look(parts)
+        except BaseException as exc:  # look() answers Apple's errors itself; anything else is the loop's
+            self.failure = exc
+        finally:
+            self.finished.set()
+
+    def done(self):
+        return self.finished.is_set()
+
+    def result(self):
+        """(result, None) or (None, error), as from Backoff.look."""
+        if self.failure is not None:
+            raise self.failure
+        return self.answer
+
+
 class SellOuts:
     """With checks every half minute a sell-out needs no extra request: it is reported when two
     checks in a row, at least CONFIRM_DELAY_SECONDS apart, miss the configuration."""
@@ -1338,7 +1373,8 @@ def run_slots(parts, every, offset, dry_run, status_minutes=0, inbox=None, sourc
     """Check at fixed times on the clock, `offset` seconds past every multiple of `every`
     seconds (60 and 0: at :00 of every minute), and in between handle the checks other
     computers hand in through `inbox`. With `standby_of` (an ssh host) this
-    is a standby for that main server (see Standby). Runs until stopped."""
+    is a standby for that main server (see Standby). This computer's own request to Apple
+    does not hold up the checks handed in meanwhile (see OwnCheck). Runs until stopped."""
     if standby_of:
         watcher = Standby(parts, dry_run, status_minutes, source, standby_of, participate, inbox, every, offset)
         sync_due = next_slot(time.time(), 60, SYNC_OFFSET)
@@ -1348,32 +1384,40 @@ def run_slots(parts, every, offset, dry_run, status_minutes=0, inbox=None, sourc
     backoff = Backoff()
     due = next_slot(time.time(), every, offset)
     fill_due = math.inf
+    asking = None  # this computer's own check until Apple answers it
     while True:
         if inbox:
             watcher.take_inbox(inbox)
+        if asking is not None and asking.done():  # after the checks handed in meanwhile, which are older
+            result, error = asking.result()
+            asking = None
+            watcher.handle(source, (result.checked_at if result else None) or utc_now(), result, error)
         now = time.time()
         if now >= sync_due:
             synced_slot = sync_due
             watcher.sync()
-            if int(synced_slot) % watcher.fill_every in watcher.fill:
+            if int(synced_slot) % watcher.fill_every in watcher.fill and asking is None:
                 # VPS 3's :45 slot coincides with the standby's status sync. Do not
                 # reschedule it to the next minute before making the requested fill.
                 watcher.fill_in(backoff, synced_slot)
             sync_due = next_slot(time.time(), 60, SYNC_OFFSET)
             fill_due = watcher.next_fill(time.time())
         elif now >= fill_due:
-            watcher.fill_in(backoff, fill_due)
+            if asking is None:  # one request to Apple at a time
+                watcher.fill_in(backoff, fill_due)
             fill_due = watcher.next_fill(time.time())
         elif now >= due:
-            if watcher.checking() and backoff.allows(due):
-                result, error = backoff.look(parts)
-                watcher.handle(source, (result.checked_at if result else None) or utc_now(), result, error)
+            if asking is not None:
+                log("Apple has not answered the last check from here yet; not asking again in this slot.")
+                watcher.beat()
+            elif watcher.checking() and backoff.allows(due):
+                asking = OwnCheck(backoff, parts)
             else:
                 watcher.beat()
             due = next_slot(time.time(), every, offset)
         else:
             wait = min(due, sync_due, fill_due) - now
-            time.sleep(min(wait, 1.0) if inbox else wait)
+            time.sleep(min(wait, 1.0) if inbox or asking is not None else wait)
 
 
 def check_to_json(source, result=None, error=None, moment=None):

@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -1087,6 +1088,53 @@ class SixComputerCycle(FourComputerCycle):
             self.assertEqual(self.world.request_times[before:], [hkt('10:00:00') + offset + i for i in (0, 180, 270)])
             self.assertTrue(all(data['source'] == source for data in delivered))
             self.assertIn('HTTP 541', delivered[0]['error'])
+
+    def test_a_slow_answer_to_vps1_does_not_hold_up_the_other_checks(self):
+        # Apple answers VPS 1's check of 10:00:30 only at 10:02:05 (a few times a day it takes a
+        # minute or more). VPS 3 sees new stock at 10:00:45: the alert goes out then, and the
+        # checks handed in meanwhile are not put aside as older than VPS 1's late answer.
+        self.github = lambda moment: {('R499', U)} if moment >= hkt('10:00:45') else set()
+        release, made = threading.Event(), []
+        self.addCleanup(release.set)
+
+        def vps(now):
+            if now < hkt('10:01:00'):
+                release.wait(10)
+            return self.github(self.clock.now)  # Apple's stock when it answers
+
+        self.vps = vps
+
+        class Recorded(self.cs.OwnCheck):
+            def __init__(self, *args):
+                made.append(self)
+                super().__init__(*args)
+
+        def answer(now):
+            if now >= hkt('10:02:05') and not release.is_set():
+                self.assertEqual(len(self.texts()), 1)  # the alert went out before Apple answered VPS 1
+                release.set()
+                made[0].finished.wait(5)
+
+        self.clock.hooks.append(answer)
+        self.clock.hooks.append(lambda now: (_ for _ in ()).throw(Stop()) if now >= hkt('10:02:20') else None)
+        with mock.patch.object(self.cs, 'OwnCheck', Recorded), mock.patch.object(self.cs, 'OWN_ANSWER_WAIT', 0.05):
+            with self.assertRaises(Stop):
+                self.cs.run_slots(list(PRO_MAX), 90, 30, False, 0, self.inbox, 'vps')
+        checks = [c for c in self.history() if 'watched' not in c]
+        self.assertEqual([c['source'] for c in checks],
+                         ['github', 'secondary', 'third', 'fourth', 'fifth', 'github', 'secondary', 'vps', 'third'])
+        self.assertEqual(checks[2]['in_stock'], {'iPhone 18 Pro Max 512GB Silver': ['Canton Road']})
+        self.assertGreaterEqual(datetime.fromisoformat(checks[7]['time']).timestamp(), hkt('10:02:05'))
+        self.assertEqual(self.world.request_times, [hkt('10:00:30')])  # not asked again at 10:02:00
+        self.assertEqual(len(self.texts()), 1)
+        self.assertIn('🟢 Появились', self.texts()[0])
+        log = sys.stdout.getvalue()
+        self.assertNotIn('older than the last check', log)
+        self.assertEqual(log.count('Apple has not answered the last check from here yet'), 1)
+
+    def test_an_error_on_the_own_check_thread_reaches_the_loop(self):
+        with mock.patch.object(self.cs, 'fetch_stock', side_effect=Stop()), self.assertRaises(Stop):
+            self.cs.run_slots(list(PRO_MAX), 90, 30, False, 0, self.inbox, 'vps')
 
     def test_delayed_checks_do_not_shift_the_silent_probe_slots(self):
         watcher = self.cs.Watcher(list(PRO_MAX), False, 10, 'vps', every=90, offset=30)
