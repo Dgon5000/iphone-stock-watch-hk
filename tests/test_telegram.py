@@ -2,6 +2,7 @@
 
 Apple and Telegram are replaced by in-process fakes; nothing leaves the machine.
 """
+import csv
 import io
 import json
 import os
@@ -1283,6 +1284,29 @@ class Report(Base):
         self.assertEqual(st1, {"ifc mall", "Causeway Bay"})
         self.assertEqual((a2.strftime("%H:%M"), s2), ("09:30", None))
         self.assertEqual(len(self.sr.intervals(checks, "iPhone 18 Pro Max 2TB Black")), 1)
+
+    def test_legacy_empty_store_lists_do_not_create_or_extend_stock(self):
+        silver = "iPhone 18 Pro Max 512GB Silver"
+        black = "iPhone 18 Pro Max 512GB Black"
+        path = self.write(
+            {"time": self.at("06:00"), "watched": [silver, black]},
+            {"time": self.at("06:00"), "stores": 6, "in_stock": {silver: [], black: []}},
+            {"time": self.at("07:05"), "stores": 6, "in_stock": {silver: ["ifc mall"], black: []}},
+            {"time": self.at("07:20"), "stores": 6, "in_stock": {silver: [], black: []}},
+            {"time": self.at("07:40"), "stores": 6, "in_stock": {silver: [], black: []}},
+        )
+        watched, checks = self.sr.load([path])
+        self.assertEqual(len(checks), 4)  # Keep the successful checks, including empty ones.
+        text = self.sr.report(watched, checks)
+        self.assertIn("🩶 512GB · Silver — 1 раз: 03.10 07:05 → 07:20 (15 мин)", text)
+        self.assertIn("➖ Ни разу не появлялись: 512GB · Black", text)
+        self.assertNotIn("сейчас в наличии", text)
+        self.assertNotIn("06:00–07:00", text)
+        rows = list(csv.DictReader(io.StringIO(self.sr.csv_text(watched, checks)), delimiter=";"))
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["Появилось (HKT)"], "2026-10-03 07:05")
+        self.assertEqual(rows[0]["Закончилось (HKT)"], "2026-10-03 07:20")
+        self.assertEqual(rows[0]["Минут"], "15")
 
     def test_report_text(self):
         watched, checks = self.sr.load([self.sample()])

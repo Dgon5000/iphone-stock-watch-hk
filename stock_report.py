@@ -68,7 +68,8 @@ def intervals(checks, title):
     runs = []
     start, stores = None, set()
     for moment, in_stock in checks:
-        if title in in_stock:
+        # Older history can keep a title with []: no store had pickup stock.
+        if in_stock.get(title):
             if start is None:
                 start, stores = moment, set()
             stores.update(in_stock[title])
