@@ -69,6 +69,11 @@ PROBLEM_ALERT_AFTER = timedelta(minutes=30)
 # While Apple releases stock its answers flicker ("in stock", nothing, "in stock"
 # seconds apart), so a sell-out is reported only if another check this much later agrees.
 CONFIRM_DELAY_SECONDS = 20
+# Checks by different computers at most this much apart were made at about the same time
+# (VPS 1's own answer can come late, stamped with Apple's time of answering), so one that is a
+# little older than the newest check acted upon still counts. Older ones only go into the
+# history, and so does a computer's check that is not newer than its own last one (a repeat).
+SIMULTANEOUS = timedelta(seconds=2)
 # Pauses between checks in --watch mode, in minutes, used in turn (--every sets fixed times
 # instead), and a quiet status of everything watched every this many minutes (0: never).
 DEFAULT_SCHEDULE = "1,2,3"
@@ -1054,6 +1059,7 @@ class Watcher:
         self.shared = Path(shared) if shared else None
         self.sources = Sources(self.state, utc_now(), occasional=("backup",) if self.shared else ())
         self.latest = None  # Apple's time of the newest check acted upon
+        self.acted = {}  # per computer, Apple's time of its newest check acted upon
         self.stuck = set()  # inbox files that could not be removed
         # For fills(): per computer, checks in a row that could not reach Apple, whether Apple
         # refused its last check, when it last checked, and the second of the minute it checks at.
@@ -1171,6 +1177,17 @@ class Watcher:
             if source:
                 self.handle(source, moment, result, error)
 
+    def stale(self, source, moment):
+        """Whether a check came too late to act upon (see SIMULTANEOUS)."""
+        if self.latest is None:
+            return False
+        own = self.acted.get(source)
+        return moment < self.latest - SIMULTANEOUS or (own is not None and moment <= own)
+
+    def act_upon(self, source, moment):
+        self.latest = max(self.latest, moment) if self.latest else moment
+        self.acted[source] = moment
+
     def handle(self, source, moment, result=None, error=None):
         """One check by `source` at `moment`: Apple's answer or the error."""
         label = source_name(source)
@@ -1191,13 +1208,13 @@ class Watcher:
                 log("Reporting changes again.")
             if set(result.products) | set(result.missing_parts) != set(self.parts):
                 log(f"ERROR: {label} checks other part numbers; its check went into the history only.", error=True)
-            elif self.latest is not None and moment <= self.latest:
+            elif self.stale(source, moment):
                 log(f"{label}: older than the last check; it went into the history only.")
             elif self.wait_until:
-                self.latest = moment
+                self.act_upon(source, moment)
                 log(f"{label}: waiting for the standby's stock before reporting changes.")
             else:
-                self.latest = moment
+                self.act_upon(source, moment)
                 reported, _ = apply_changes(
                     result, self.parts, self.state, self.dry_run, lambda gone: self.sell_outs.confirm(gone, moment)
                 )
@@ -1353,7 +1370,7 @@ class Standby(Watcher):
         self.sources = Sources(self.state, now)
         self.status = Status(self.status.minutes)
         self.sell_outs = SellOuts()
-        self.latest = None
+        self.latest, self.acted = None, {}
         if not self.dry_run:
             tell(f"⚠️ VPS 1 не работает уже {minutes} мин ({why}). "
                  f"Проверку и отправку уведомлений продолжает {source_name(self.source)}.")

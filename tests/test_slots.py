@@ -1147,6 +1147,27 @@ class SixComputerCycle(FourComputerCycle):
         arrived = hkt('10:00:46') + 0.5
         self.assertTrue(arrived <= sent[0] <= arrived + 0.2 + 1e-6, sent[0] - arrived)
 
+    def test_checks_made_at_the_same_moment_all_count_and_repeats_do_not(self):
+        # Apple answers VPS 1 late, at 10:00:45, and VPS 3 checked at 10:00:45 too, a second
+        # earlier by Apple's clock: both count, so VPS 3's new stock is reported. A repeat of a
+        # check, and a check well older than the newest, only go into the history.
+        self.github = lambda moment: {('R499', U)} if moment >= hkt('10:00:45') else set()
+        watcher = self.cs.Watcher(list(PRO_MAX), False, 0, 'vps', shared=self.inbox, every=90, offset=30)
+        at = lambda text, back=0: datetime.fromtimestamp(hkt(text) - back, timezone.utc)
+        watcher.handle('vps', at('10:00:45'), self.result(set(), at('10:00:45')))
+        watcher.handle('third', at('10:00:45', 1), self.result({('R499', U)}, at('10:00:45', 1)))
+        self.assertEqual(len(self.texts()), 1)
+        self.assertIn('🟢 Появились', self.texts()[0])
+        watcher.handle('third', at('10:00:45', 1), self.result(set(), at('10:00:45', 1)))   # a repeat
+        watcher.handle('github', at('10:00:42'), self.result(set(), at('10:00:42')))       # 3 s older
+        watcher.handle('fourth', at('10:01:00'), self.result({('R499', U)}, at('10:01:00')))
+        self.assertEqual(len(self.texts()), 1)
+        log = sys.stdout.getvalue()
+        self.assertEqual(log.count('older than the last check'), 2)
+        self.assertIn('VPS 3: older than the last check', log)
+        self.assertIn('GitHub: older than the last check', log)
+        self.assertEqual(len([c for c in self.history() if 'in_stock' in c]), 5)
+
     def test_an_error_on_the_own_check_thread_reaches_the_loop(self):
         with mock.patch.object(self.cs, 'fetch_stock', side_effect=Stop()), self.assertRaises(Stop):
             self.cs.run_slots(list(PRO_MAX), 90, 30, False, 0, self.inbox, 'vps')
