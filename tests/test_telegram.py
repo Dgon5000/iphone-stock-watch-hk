@@ -218,7 +218,8 @@ class Clock:
 
     def sleep(self, seconds):
         self.sleeps.append(seconds)
-        self.now += seconds
+        # Rounded so that steps of a fraction of a second still meet whole seconds exactly.
+        self.now = round(self.now + seconds, 6)
         for hook in list(self.hooks):
             hook(self.now)
 
@@ -1284,6 +1285,26 @@ class Report(Base):
         self.assertEqual(st1, {"ifc mall", "Causeway Bay"})
         self.assertEqual((a2.strftime("%H:%M"), s2), ("09:30", None))
         self.assertEqual(len(self.sr.intervals(checks, "iPhone 18 Pro Max 2TB Black")), 1)
+
+    def test_checks_with_the_same_stock_share_memory_and_all_still_count(self):
+        # Six computers add about 5,800 checks a day, nearly all with the stock of the one
+        # before: those share one dict, so /report does not need memory for every check.
+        silver, black = "iPhone 18 Pro Max 512GB Silver", "iPhone 18 Pro Max 2TB Black"
+        path = self.write(
+            {"time": self.at("06:00"), "watched": [silver, black]},
+            *({"time": f"2026-10-03T06:{m:02d}:{s:02d}+08:00", "source": "vps", "stores": 6,
+               "in_stock": {black: ["Canton Road"]}} for m in range(1, 5) for s in (0, 15, 30, 45)),
+            {"time": self.at("06:05"), "stores": 6, "in_stock": {black: ["Canton Road"], silver: ["ifc mall"]}},
+            {"time": self.at("06:06"), "stores": 6, "in_stock": {black: ["Canton Road"]}},
+        )
+        watched, checks = self.sr.load([path])
+        self.assertEqual(len(checks), 18)
+        self.assertEqual(len({id(in_stock) for _, in_stock in checks}), 2)
+        self.assertEqual(checks[-1][1], {black: ["Canton Road"]})
+        self.assertEqual(watched, [silver, black])
+        text = self.sr.report(watched, checks)
+        self.assertIn("проверок: 18", text)
+        self.assertIn("🩶 512GB · Silver — 1 раз: 03.10 06:05 → 06:06 (1 мин)", text)
 
     def test_legacy_empty_store_lists_do_not_create_or_extend_stock(self):
         silver = "iPhone 18 Pro Max 512GB Silver"

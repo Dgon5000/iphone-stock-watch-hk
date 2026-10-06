@@ -79,6 +79,9 @@ NETWORK_RETRY_SECONDS = 5
 # answer (it can take over a minute) is awaited in the background while the checks the other
 # computers hand in are handled (see OwnCheck).
 OWN_ANSWER_WAIT = 5
+# --watch --inbox looks for the checks other computers hand in this often, so each one is
+# handled, and any alert sent, within this many seconds of arriving.
+INBOX_POLL_SECONDS = 0.2
 # When Apple refuses requests (HTTP 403, 429, or 541 — Apple's own "too many requests from
 # this address"), the computer pauses its checks for 2, 4, 8 and then at most 15 minutes
 # instead of insisting.
@@ -1417,7 +1420,7 @@ def run_slots(parts, every, offset, dry_run, status_minutes=0, inbox=None, sourc
             due = next_slot(time.time(), every, offset)
         else:
             wait = min(due, sync_due, fill_due) - now
-            time.sleep(min(wait, 1.0) if inbox or asking is not None else wait)
+            time.sleep(min(wait, INBOX_POLL_SECONDS) if inbox or asking is not None else wait)
 
 
 def check_to_json(source, result=None, error=None, moment=None):

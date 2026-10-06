@@ -1132,6 +1132,21 @@ class SixComputerCycle(FourComputerCycle):
         self.assertNotIn('older than the last check', log)
         self.assertEqual(log.count('Apple has not answered the last check from here yet'), 1)
 
+    def test_a_handed_in_check_is_alerted_within_a_fifth_of_a_second(self):
+        # VPS 3's check arrives at 10:00:46.5, between whole seconds: VPS 1 sends the alert
+        # within INBOX_POLL_SECONDS, not only at the next whole second.
+        self.next_checks['third'] += 0.5
+        self.github = lambda moment: {('R499', U)} if moment >= hkt('10:00:45') else set()
+        sent, telegram = [], self.world.telegram
+        self.world.telegram = lambda url, data: (sent.append(self.clock.now), telegram(url, data))[1]
+        self.clock.hooks.append(lambda now: (_ for _ in ()).throw(Stop()) if now >= hkt('10:00:50') else None)
+        with self.assertRaises(Stop):
+            self.cs.run_slots(list(PRO_MAX), 90, 30, False, 0, self.inbox, 'vps')
+        self.assertEqual(len(sent), 1)
+        self.assertIn('🟢 Появились', self.texts()[0])
+        arrived = hkt('10:00:46') + 0.5
+        self.assertTrue(arrived <= sent[0] <= arrived + 0.2 + 1e-6, sent[0] - arrived)
+
     def test_an_error_on_the_own_check_thread_reaches_the_loop(self):
         with mock.patch.object(self.cs, 'fetch_stock', side_effect=Stop()), self.assertRaises(Stop):
             self.cs.run_slots(list(PRO_MAX), 90, 30, False, 0, self.inbox, 'vps')

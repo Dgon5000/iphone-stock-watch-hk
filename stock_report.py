@@ -46,21 +46,28 @@ def import_journal(lines):
 
 
 def load(paths):
-    """Watched titles (in watch order) and checks [(time, {title: [stores]})] sorted by time."""
-    watched, checks = [], []
+    """Watched titles (in watch order) and checks [(time, {title: [stores]})] sorted by time.
+    The files are read line by line and checks that found the same stock share one dict, so
+    memory grows with the changes in stock rather than with the number of checks."""
+    watched, checks, same = [], [], {}
     for path in paths:
-        for line in Path(path).read_text(encoding="utf-8").splitlines():
-            try:
-                entry = json.loads(line)
-                moment = datetime.fromisoformat(entry["time"])
-            except (ValueError, KeyError, TypeError):
-                continue
-            watched += [title for title in entry.get("watched", []) if title not in watched]
-            if isinstance(entry.get("in_stock"), dict):
-                checks.append((moment, entry["in_stock"]))
+        with open(path, encoding="utf-8") as lines:
+            for line in lines:
+                try:
+                    entry = json.loads(line)
+                    moment = datetime.fromisoformat(entry["time"])
+                except (ValueError, KeyError, TypeError):
+                    continue
+                watched += [title for title in entry.get("watched", []) if title not in watched]
+                in_stock = entry.get("in_stock")
+                if isinstance(in_stock, dict):
+                    checks.append((moment, same.setdefault(json.dumps(in_stock, ensure_ascii=False), in_stock)))
     checks.sort(key=lambda check: check[0])
+    seen = set()
     for _, in_stock in checks:
-        watched += [title for title in in_stock if title not in watched]
+        if id(in_stock) not in seen:  # a shared dict's titles were taken where it first came
+            seen.add(id(in_stock))
+            watched += [title for title in in_stock if title not in watched]
     return watched, checks
 
 
