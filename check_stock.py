@@ -85,10 +85,9 @@ MAX_CHECK_BYTES = 64 * 1024
 INBOX_LIMIT = 500
 INBOX_STALE_SECONDS = 300
 WORKING_WINDOW = timedelta(minutes=3)
-SOURCE_NAMES = {"vps": "VPS", "github": "GitHub", "mac": "Mac", "backup": "Запасной VPS",
-                "secondary": "Дополнительный VPS", "third": "VPS 3"}
-# Short server labels in Telegram's per-source check counts.
-COUNT_SOURCE_NAMES = {"vps": "VPS 1", "secondary": "VPS 2", "backup": "VPS 2", "third": "VPS 3"}
+# One set of server names for check counts, errors, recovery notices and logs.
+SOURCE_NAMES = {"vps": "VPS 1", "github": "GitHub", "mac": "Mac", "backup": "VPS 2",
+                "secondary": "VPS 2", "third": "VPS 3"}
 # A standby server (--standby-of) asks the main server how it is at this many seconds past
 # every minute (--sync), keeping a copy of its stock. It stands in once the main server has
 # not been working for MAIN_SILENT_AFTER; back after a break that long, the main server
@@ -778,7 +777,7 @@ def check_counts_footer(minutes, counts, sources=()):
     shown += sorted(wanted - set(shown))
     lines = [f"🔁 Проверок за {minutes} мин: {sum(combined.values())}"]
     for source in shown:
-        name = escape(COUNT_SOURCE_NAMES.get(source, source_name(source)))
+        name = escape(source_name(source))
         lines.append(f"• <b>{name}</b> — {combined[source]}")
     return "\n".join(lines)
 
@@ -978,7 +977,8 @@ class Sources:
             minutes = int(silent.total_seconds() // 60)
             error = self.errors.get(source)
             text = f"⚠️ {name}: проверки {'не работают' if error else 'не приходят'} уже {minutes} мин. "
-            text += f"Наличие продолжает проверять {', '.join(source_name(s) for s in working)}."
+            names = list(dict.fromkeys(source_name(s) for s in working))
+            text += f"Наличие продолжает проверять {', '.join(names)}."
             if error:
                 text += f"\n\nПоследняя ошибка: {escape(error)}"
             if tell(text):
@@ -1267,8 +1267,9 @@ class Standby(Watcher):
                 self.active = False
                 log("The main server works again: handed back the stock; standing aside.")
                 if not self.dry_run:
-                    behavior = "Дополнительный сервер снова передаёт ему свои проверки." if self.participate else "Запасной вернулся в режим ожидания."
-                    tell(f"✅ Основной сервер снова проверяет. {behavior}")
+                    name = source_name(self.source)
+                    behavior = f"{name} снова передаёт ему свои проверки." if self.participate else f"{name} вернулся в режим ожидания."
+                    tell(f"✅ VPS 1 снова работает. {behavior}")
             elif not self.dry_run:
                 try:
                     self.state["available"] = stock_from_json(reply.get("available"))
@@ -1302,7 +1303,8 @@ class Standby(Watcher):
         self.sell_outs = SellOuts()
         self.latest = None
         if not self.dry_run:
-            tell(f"⚠️ Основной сервер не работает уже {minutes} мин ({why}). Проверку продолжает запасной сервер.")
+            tell(f"⚠️ VPS 1 не работает уже {minutes} мин ({why}). "
+                 f"Проверку и отправку уведомлений продолжает {source_name(self.source)}.")
 
 
 def fill_from_json(items, every=60):

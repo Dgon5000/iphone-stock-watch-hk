@@ -1359,6 +1359,16 @@ class Report(Base):
         })
         self.assertEqual(entries[1]["in_stock"], {})
 
+    def test_journal_import_recognizes_current_and_legacy_server_names(self):
+        names = ("VPS 1", "VPS 2", "VPS 3", "GitHub", "VPS", "Запасной VPS", "Дополнительный VPS")
+        lines = [
+            f"[2026-10-03 18:00:{i:02d} HKT] {name}: 6 stores × 12 models checked — iPhone 18 Pro Max 2TB Silver: ifc mall"
+            for i, name in enumerate(names)
+        ]
+        entries = list(self.sr.import_journal(lines))
+        self.assertEqual(len(entries), len(names))
+        self.assertTrue(all(e["in_stock"] == {"iPhone 18 Pro Max 2TB Silver": ["ifc mall"]} for e in entries))
+
     def test_groups_in_watch_order(self):
         watched, _ = self.sr.load([self.sample()])
         self.assertEqual(self.sr.groups(watched), [("iPhone 18 Pro Max", "512GB"), ("iPhone 18 Pro Max", "1TB"),

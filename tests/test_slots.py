@@ -71,6 +71,45 @@ class FakeClockBase(Base):
         return [json.loads(line) for line in f.read_text().splitlines()] if f.exists() else []
 
 
+class SourceNotifications(FakeClockBase):
+    def test_failures_and_recovery_use_the_same_names_as_check_counts(self):
+        labels = {"vps": "VPS 1", "secondary": "VPS 2", "third": "VPS 3", "github": "GitHub"}
+        for failed, name in labels.items():
+            with self.subTest(source=failed):
+                start = self.cs.utc_now()
+                later = start + timedelta(minutes=31)
+                sources = self.cs.Sources({"sources": list(labels)}, start)
+                sources.seen(failed, start)
+                sources.seen(failed, later, RuntimeError("Apple returned HTTP 541"))
+                for source in labels:
+                    if source != failed:
+                        sources.seen(source, later)
+                before = len(self.texts())
+                sources.report(later)
+                sources.report(later + timedelta(seconds=5))  # No repeated outage notice.
+                sources.seen(failed, later + timedelta(seconds=10))
+                sources.report(later + timedelta(seconds=10))
+                working = ", ".join(label for source, label in labels.items() if source != failed)
+                self.assertEqual(self.texts()[before:], [
+                    f"⚠️ {name}: проверки не работают уже 31 мин. Наличие продолжает проверять {working}."
+                    "\n\nПоследняя ошибка: Apple returned HTTP 541",
+                    f"✅ {name}: проверки снова работают.",
+                ])
+                self.assertIn(f"<b>{name}</b>", self.cs.check_counts_footer(10, {failed: 1}))
+
+    def test_legacy_backup_and_secondary_are_one_named_server(self):
+        start = self.cs.utc_now()
+        later = start + timedelta(minutes=31)
+        sources = self.cs.Sources({"sources": ["vps", "secondary", "backup"]}, start)
+        sources.seen("vps", start)
+        sources.seen("secondary", later)
+        sources.seen("backup", later)
+        sources.report(later)
+        self.assertEqual(self.texts(), [
+            "⚠️ VPS 1: проверки не приходят уже 31 мин. Наличие продолжает проверять VPS 2.",
+        ])
+
+
 class SharedBase(FakeClockBase):
     """run_slots on the fake clock: the server checks the fake Apple at :00 of every minute;
     GitHub's check of every :30 arrives in the inbox through ingest() a second later."""
@@ -173,7 +212,7 @@ class Shared(SharedBase):
         self.github = lambda moment: None if hkt("10:05:00") < moment < hkt("10:50:00") else set()
         self.run_until(hkt("10:52:10"))
         self.assertEqual(self.texts(), [
-            "⚠️ GitHub: проверки не приходят уже 30 мин. Наличие продолжает проверять VPS.",
+            "⚠️ GitHub: проверки не приходят уже 30 мин. Наличие продолжает проверять VPS 1.",
             "✅ GitHub: проверки снова работают.",
         ])
         self.assertNotIn("down", self.state())
@@ -201,7 +240,7 @@ class Shared(SharedBase):
                          [hkt(t) for t in ("10:01:00", "10:03:00", "10:07:00", "10:15:00", "10:30:00", "10:45:00")])
         texts = self.texts()
         self.assertEqual(len(texts), 1)  # GitHub kept watching, so no "nothing works" alert
-        self.assertTrue(texts[0].startswith("⚠️ VPS: проверки не работают уже 30 мин. Наличие продолжает проверять GitHub."), texts[0])
+        self.assertTrue(texts[0].startswith("⚠️ VPS 1: проверки не работают уже 30 мин. Наличие продолжает проверять GitHub."), texts[0])
         self.assertIn("Последняя ошибка: Apple returned HTTP 429", texts[0])
         self.assertIn("no checks from here for 2 min", self.stderr())
         self.assertIn("no checks from here for 15 min", self.stderr())
@@ -555,7 +594,7 @@ class MainFills(SharedBase):
         texts = self.texts()
         self.assertTrue(texts[0].endswith("🔁 Проверок за 10 мин: 20\n• VPS 1 — 9\n• VPS 2 — 1\n• GitHub — 10"), texts[0])
         self.assertFalse([t for t in texts if t.startswith("⚠️")])  # a standby is meant to be quiet
-        self.assertIn("Запасной VPS: 6 stores × 12 models checked", sys.stdout.getvalue())
+        self.assertIn("VPS 2: 6 stores × 12 models checked", sys.stdout.getvalue())
 
 
 class SyncCommand(FakeClockBase):
@@ -683,9 +722,9 @@ class StandbyServer(StandbyBase):
         self.apple = lambda moment: {("R499", U)} | ({("R409", B)} if moment >= hkt("10:07:00") else set())
         self.run_until(hkt("10:12:10"), world)
         texts = self.texts()
-        self.assertEqual(texts[0], "⚠️ Основной сервер не работает уже 3 мин (нет связи). Проверку продолжает запасной сервер.")
+        self.assertEqual(texts[0], "⚠️ VPS 1 не работает уже 3 мин (нет связи). Проверку и отправку уведомлений продолжает VPS 2.")
         self.assertIn("🟢 Появились · iPhone 18 Pro Max\n🖤 2TB · Black", texts[1])  # 512GB Silver was known: no alert
-        self.assertEqual(texts[2], "✅ Основной сервер снова проверяет. Запасной вернулся в режим ожидания.")
+        self.assertEqual(texts[2], "✅ VPS 1 снова работает. VPS 2 вернулся в режим ожидания.")
         self.assertEqual(len(texts), 3)
         self.assertEqual(self.world.request_times, [hkt(f"10:{m:02d}:00") for m in range(6, 10)])  # 10:05:45 → 10:09:45
         back = [(t, p) for t, p in self.calls if p]
@@ -700,8 +739,8 @@ class StandbyServer(StandbyBase):
     def test_stands_in_at_once_when_the_main_server_stopped_checking_long_ago(self):
         self.main_alive = datetime.fromtimestamp(self.clock.now - 600, timezone.utc).isoformat()
         self.run_until(hkt("10:02:10"))
-        self.assertEqual(self.texts()[0], "⚠️ Основной сервер не работает уже 10 мин (служба проверки на нём остановлена). "
-                                          "Проверку продолжает запасной сервер.")
+        self.assertEqual(self.texts()[0], "⚠️ VPS 1 не работает уже 10 мин (служба проверки на нём остановлена). "
+                                          "Проверку и отправку уведомлений продолжает VPS 2.")
         self.assertEqual(self.world.request_times, [hkt("10:01:00"), hkt("10:02:00")])
 
     def test_the_main_servers_clock_does_not_matter(self):
@@ -733,7 +772,7 @@ class StandbyFirstContact(StandbyBase):
         (self.tmp / "stock_state.json").write_text(json.dumps({"main_seen_utc": "2026-10-03T01:00:00+00:00", "available": SILVER}))
         self.main_down = True
         self.run_until(hkt("10:05:10"))
-        self.assertTrue(self.texts()[0].startswith("⚠️ Основной сервер не работает уже 3 мин (нет связи)."))
+        self.assertTrue(self.texts()[0].startswith("⚠️ VPS 1 не работает уже 3 мин (нет связи)."))
         self.assertEqual(self.world.request_times, [hkt("10:04:00"), hkt("10:05:00")])
 
 
@@ -776,7 +815,7 @@ class StandbyFillIn(StandbyBase):
         self.assertEqual([t for t, _ in checks], self.world.request_times)
         self.assertEqual({c["source"] for _, c in checks}, {"backup"})
         self.assertEqual(self.world.sent(), [])  # the main server decides what to send
-        self.assertIn("For VPS: 6 stores × 12 models checked", sys.stdout.getvalue())
+        self.assertIn("For VPS 1: 6 stores × 12 models checked", sys.stdout.getvalue())
 
     def test_its_own_refusal_pauses_filling_in(self):
         self.main_fill = lambda now: [{"source": "github", "offset": 30}]
@@ -902,9 +941,9 @@ class ParticipatingStandby(StandbyBase):
         self.run_until(hkt("10:11:40"), trouble)
         texts = self.texts()
         self.assertEqual(len(texts), 3)
-        self.assertIn("Основной сервер не работает уже 3 мин", texts[0])
+        self.assertIn("VPS 1 не работает уже 3 мин", texts[0])
         self.assertIn("🟢 Появились · iPhone 18 Pro Max\n🖤 2TB · Black", texts[1])
-        self.assertIn("Основной сервер снова проверяет", texts[2])
+        self.assertIn("✅ VPS 1 снова работает. VPS 2 снова передаёт ему свои проверки.", texts[2])
         self.assertEqual(self.accepted[-1]["time"], utc("10:11:20").isoformat())
         self.assertTrue(any("history" in p for _, p in self.calls))
         self.assertEqual(list(self.inbox.glob("*.json")), [])
