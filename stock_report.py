@@ -25,7 +25,7 @@ MERGE_GAP = timedelta(minutes=5)
 SHOW_LAST = 8  # appearances listed per configuration
 JOURNAL_LINE = re.compile(
     r"^\[(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d) HKT\] "
-    r"(?:(?:Check \d+/\d+|VPS(?: [123])?|GitHub|Mac|Запасной VPS|Дополнительный VPS): )?"
+    r"(?:(?:Check \d+/\d+|VPS(?: [1-5])?|GitHub|Mac|Запасной VPS|Дополнительный VPS): )?"
     r"(\d+) stores × \d+ models checked — (.*)$"
 )
 

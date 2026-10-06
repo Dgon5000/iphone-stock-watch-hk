@@ -73,7 +73,7 @@ class FakeClockBase(Base):
 
 class SourceNotifications(FakeClockBase):
     def test_failures_and_recovery_use_the_same_names_as_check_counts(self):
-        labels = {"vps": "VPS 1", "secondary": "VPS 2", "third": "VPS 3", "github": "GitHub"}
+        labels = {"vps": "VPS 1", "secondary": "VPS 2", "third": "VPS 3", "fourth": "VPS 4", "fifth": "VPS 5", "github": "GitHub"}
         for failed, name in labels.items():
             with self.subTest(source=failed):
                 start = self.cs.utc_now()
@@ -352,6 +352,35 @@ class Ingest(FakeClockBase):
 
 
 class RefusalProtection(FakeClockBase):
+    def test_restart_preserves_the_pause_and_failure_progression(self):
+        self.world.apple_errors = [HTTPError('u', 541, '', {}, io.BytesIO(b'')) for _ in range(2)]
+        first = self.cs.Backoff()
+        first.look(list(PRO_MAX))
+        self.clock.now += 90
+        restarted = self.cs.Backoff()
+        self.assertFalse(restarted.allows(self.clock.now))
+        self.clock.now = restarted.until
+        restarted.look(list(PRO_MAX))
+        self.assertEqual(restarted.until - self.clock.now, 240)
+        self.clock.now = restarted.until
+        restarted.look(list(PRO_MAX))
+        self.assertFalse(self.cs.BACKOFF_FILE.exists())
+        self.assertEqual((self.cs.Backoff().refusals, self.cs.Backoff().until), (0, 0.0))
+
+    def test_invalid_saved_pause_does_not_stop_checks_indefinitely(self):
+        for content in ('broken', json.dumps({'refusals': True, 'until': self.clock.now + 120}),
+                        json.dumps({'refusals': 3, 'until': self.clock.now + 86400})):
+            self.cs.BACKOFF_FILE.write_text(content)
+            self.assertTrue(self.cs.Backoff().allows(self.clock.now))
+
+    def test_a_save_failure_keeps_the_in_memory_pause(self):
+        self.world.apple_errors = [HTTPError('u', 541, '', {}, io.BytesIO(b''))]
+        backoff = self.cs.Backoff()
+        with mock.patch.object(self.cs, 'write_shared', side_effect=OSError('disk failure')):
+            _, error = backoff.look(list(PRO_MAX))
+        self.assertEqual(error.code, 541)
+        self.assertFalse(backoff.allows(self.clock.now + 119))
+
     def test_repeated_refusals_increase_the_pause_cap_it_and_reset_after_success(self):
         for code in (403, 429, 541):
             with self.subTest(code=code):
@@ -643,6 +672,12 @@ class SyncCommand(FakeClockBase):
         self.assertEqual(self.sync(json.dumps({'check': data}).encode())[0], 0)
         [saved] = self.shared.glob('*.json')
         self.assertEqual(json.loads(saved.read_text()), data)
+
+    def test_passes_new_probe_checks_from_the_standby_to_the_main(self):
+        for source in ('fourth', 'fifth'):
+            data = self.cs.check_to_json(source, self.result({('R409', U)}, utc('10:01:00')))
+            self.assertEqual(self.sync(json.dumps({'check': data}).encode())[0], 0)
+        self.assertEqual({json.loads(p.read_text())['source'] for p in self.shared.glob('*.json')}, {'fourth', 'fifth'})
 
     def test_refuses_what_is_not_right(self):
         with mock.patch.object(self.cs, "MAX_SYNC_BYTES", 200):
@@ -1004,6 +1039,67 @@ class FourComputerCycle(SharedBase):
         self.assertIn('HTTP 541', delivered[0][1]['error'])
 
 
+class SixComputerCycle(FourComputerCycle):
+    def setUp(self):
+        super().setUp()
+        self.next_checks = {source: hkt('10:00:00') + offset
+                            for source, offset in self.cs.CYCLE_SLOTS.items() if source != 'vps'}
+
+    def hand_in(self, now):
+        for source in self.next_checks:
+            while now >= self.next_checks[source] + 1:
+                moment = self.next_checks[source]
+                self.next_checks[source] += 90
+                data = self.cs.check_to_json(source, self.result(self.github(moment),
+                                             datetime.fromtimestamp(moment, timezone.utc)))
+                self.assertEqual(self.ingest(self.inbox, source, io.BytesIO(json.dumps(data).encode() + b'\n')), 0)
+
+    def test_15_second_cycle_has_one_alert_per_change_and_a_combined_history(self):
+        self.vps = self.github = lambda moment: {('R499', U)} if hkt('10:01:00') <= moment < hkt('10:03:00') else set()
+        self.clock.hooks.append(lambda now: (_ for _ in ()).throw(Stop()) if now >= hkt('10:04:20') else None)
+        with self.assertRaises(Stop):
+            self.cs.run_slots(list(PRO_MAX), 90, 30, False, 0, self.inbox, 'vps')
+        checks = [c for c in self.history() if 'watched' not in c]
+        order = ('github', 'secondary', 'vps', 'third', 'fourth', 'fifth')
+        expected = [(hkt('10:00:00') + i * 15, order[i % 6]) for i in range(18)]
+        self.assertEqual([(datetime.fromisoformat(c['time']).timestamp(), c['source']) for c in checks], expected)
+        self.assertEqual(len(self.texts()), 2)
+        self.assertIn('🟢 Появились', self.texts()[0])
+        self.assertIn('🔴 Закончились', self.texts()[1])
+        self.assertEqual(json.loads((self.inbox / 'status.sync').read_text())['every'], 90)
+        self.assertEqual(set(self.state()['sources']), set(order))
+        footer = self.cs.check_counts_footer(5, {source: 3 for source in order})
+        self.assertIn('• <b>VPS 4</b> — 3\n• <b>VPS 5</b> — 3', footer)
+
+    def test_github_probe_uses_the_first_slot(self):
+        with mock.patch.object(self.cs, 'deliver', return_value=None):
+            self.cs.run_probe(list(PRO_MAX), 'feed', 90, 0, minutes=5)
+        self.assertEqual(self.world.request_times, [hkt('10:00:00') + i * 90 for i in range(4)])
+
+    def test_vps3_uses_the_last_slot_and_its_own_backoff(self):
+        for source, offset in (('third', 45), ('fourth', 60), ('fifth', 75)):
+            self.clock.now = hkt('09:59:59')
+            before = len(self.world.request_times)
+            self.world.apple_errors = [HTTPError('u', 541, '', {}, io.BytesIO(b''))]
+            delivered = []
+            with mock.patch.object(self.cs, 'deliver', side_effect=lambda host, data: delivered.append(data)):
+                self.cs.run_probe(list(PRO_MAX), 'feed', 90, offset, minutes=6, source=source, backup='feed2')
+            self.assertEqual(self.world.request_times[before:], [hkt('10:00:00') + offset + i for i in (0, 180, 270)])
+            self.assertTrue(all(data['source'] == source for data in delivered))
+            self.assertIn('HTTP 541', delivered[0]['error'])
+
+    def test_delayed_checks_do_not_shift_the_silent_probe_slots(self):
+        watcher = self.cs.Watcher(list(PRO_MAX), False, 10, 'vps', every=90, offset=30)
+        for source, offset in (('github', 0), ('third', 45), ('fourth', 60), ('fifth', 75)):
+            stamp = datetime.fromtimestamp(hkt('10:00:00') + offset + 2, timezone.utc)
+            watcher.note(source, stamp, self.result(set(), stamp), None)
+        wanted = watcher.fills(utc('10:06:00'))
+        self.assertEqual({item['source']: item['offset'] for item in wanted},
+                         {'github': 0, 'third': 45, 'fourth': 60, 'fifth': 75})
+        watcher.note('fourth', utc('10:06:00'), None, RuntimeError('Apple returned HTTP 541'))
+        self.assertNotIn('fourth', {item['source'] for item in watcher.fills(utc('10:10:00'))})
+
+
 class Installer(unittest.TestCase):
     """vps_install.sh in a sandbox: fake systemctl, useradd, chown; folders in a temp dir."""
 
@@ -1057,7 +1153,7 @@ class Installer(unittest.TestCase):
         done = self.install("feed-key", self.KEY)
         self.assertEqual(done.returncode, 0, done.stderr)
         unit = (self.units / "iphone-stock-watch-hk.service").read_text()
-        self.assertIn(f"check_stock.py --watch --every 60 --offset 30 --status-minutes 10 --inbox {self.inbox}\n", unit)
+        self.assertIn(f"check_stock.py --watch --every 90 --offset 30 --status-minutes 10 --inbox {self.inbox}\n", unit)
         self.assertIn(f"ReadWritePaths={self.app} {self.inbox}\n", unit)
         self.assertEqual(self.keys(), f'restrict,command="{self.python} -I {self.lib}/check_stock.py --ingest {self.inbox} '
                                       f'--source github" {self.KEY}\n')
@@ -1111,7 +1207,7 @@ class Installer(unittest.TestCase):
         done = self.install("standby", "198.51.100.7", MAIN_HOST_KEY=self.MAIN_KEY)
         self.assertEqual(done.returncode, 0, done.stderr)
         unit = (self.units / "iphone-stock-watch-hk.service").read_text()
-        self.assertIn(f"--every 60 --offset 15 --status-minutes 10 --inbox {self.inbox} --source secondary --standby-of main --participate\n", unit)
+        self.assertIn(f"--every 90 --offset 15 --status-minutes 10 --inbox {self.inbox} --source secondary --standby-of main --participate\n", unit)
         self.assertFalse((self.units / "iphone-stock-watch-hk-bot.service").exists())  # the bot stays on the main server
         self.assertEqual((self.lib / "role").read_text(), "standby 198.51.100.7\n")
         ssh = self.app / ".ssh"
@@ -1190,6 +1286,26 @@ class Installer(unittest.TestCase):
         self.assertEqual(self.install().returncode, 0)
         self.assertIn(expected, self.keys().splitlines())
 
+    def test_each_new_probe_key_forces_its_source_and_keeps_existing_keys(self):
+        self.assertEqual(self.install('feed-key', self.KEY).returncode, 0)
+        self.assertEqual(self.install('probe-key', self.KEY.replace('github-feed', 'vps3-feed')).returncode, 0)
+        for source in ('fourth', 'fifth'):
+            key = self.KEY.replace('github-feed', source + '-feed')
+            done = self.install('probe-key', key, source)
+            self.assertEqual(done.returncode, 0, done.stderr)
+            row = next(row for row in self.keys().splitlines() if f'--source {source}"' in row)
+            command = row.split('command="')[1].split('"')[0].split()
+            data = json.dumps({'source': 'github', 'time': '2026-10-03T10:01:00+08:00', 'error': 'HTTP 541'}) + '\n'
+            done = subprocess.run(command, input=data, capture_output=True, text=True, env=self.env, timeout=30)
+            self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual({json.loads(p.read_text())['source'] for p in self.inbox.glob('*.json')}, {'fourth', 'fifth'})
+        keys = self.keys()
+        self.assertEqual(len(keys.splitlines()), 4)
+        self.assertEqual(self.install().returncode, 0)
+        self.assertEqual(self.keys(), keys)
+        self.assertEqual(self.install('probe-key', self.KEY, 'github').returncode, 1)
+        self.assertEqual(self.keys(), keys)
+
     def probe_install(self, **env):
         return subprocess.run(['bash', str(self.src / 'vps_probe_install.sh')],
                               env={**self.env, 'MAIN_HOST_KEY': self.MAIN_KEY, 'BACKUP_HOST_KEY': self.MAIN_KEY,
@@ -1200,7 +1316,7 @@ class Installer(unittest.TestCase):
         done = self.probe_install(PART_NUMBERS=U)
         self.assertEqual(done.returncode, 0, done.stderr)
         unit = (self.units / 'iphone-stock-watch-hk.service').read_text()
-        self.assertIn('--probe feed --backup feed2 --every 60 --offset 45 --source third', unit)
+        self.assertIn('--probe feed --backup feed2 --every 90 --offset 45 --source third', unit)
         self.assertIn('Restart=always', unit)
         self.assertFalse((self.units / 'iphone-stock-watch-hk-bot.service').exists())
         self.assertEqual((self.app / 'config.env').read_text(), f'PART_NUMBERS={U}\n')
@@ -1219,8 +1335,26 @@ class Installer(unittest.TestCase):
         self.assertIn('другая роль', done.stderr)
         self.assertEqual(unit.read_bytes(), before)
 
+    def test_vps4_installer_uses_its_slot_and_keeps_its_identity(self):
+        (self.app / 'config.env').unlink()
+        done = self.probe_install(SOURCE='fourth')
+        self.assertEqual(done.returncode, 0, done.stderr)
+        unit = self.units / 'iphone-stock-watch-hk.service'
+        self.assertIn('--every 90 --offset 60 --source fourth', unit.read_text())
+        before = unit.read_bytes()
+        self.assertEqual(self.probe_install(SOURCE='fifth').returncode, 1)
+        self.assertEqual(unit.read_bytes(), before)
+        self.assertNotIn('TELEGRAM', (self.app / 'config.env').read_text())
+
+    def test_vps5_installer_uses_its_slot_and_rejects_unknown_sources(self):
+        (self.app / 'config.env').unlink()
+        done = self.probe_install(SOURCE='fifth')
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn('--every 90 --offset 75 --source fifth', (self.units / 'iphone-stock-watch-hk.service').read_text())
+        self.assertEqual(self.probe_install(SOURCE='fifth; true').returncode, 1)
+
     def test_bad_settings_and_commands_are_refused(self):
-        for env in ({"EVERY": "5"}, {"OFFSET": "60"}, {"STATUS_MINUTES": "x"}, {"EVERY": "1m"}):
+        for env in ({"EVERY": "5"}, {"OFFSET": "90"}, {"STATUS_MINUTES": "x"}, {"EVERY": "1m"}):
             with self.subTest(env=env):
                 self.assertEqual(self.install(**env).returncode, 1)
         done = self.install("frobnicate")

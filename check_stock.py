@@ -5,9 +5,10 @@ Checks in-store pickup availability of the watched iPhone part numbers at every
 Apple Store in Hong Kong and sends one Telegram alert when a configuration comes
 into stock at any of them.
 
-Four computers share a 60-second cycle: GitHub at offset 0 (--probe), a participating
+Six computers share a 90-second cycle: GitHub at offset 0 (--probe), a participating
 standby at offset 15 (--watch --standby-of HOST --participate), and the main server at
-offset 30 (--watch --every 60 --offset 30 --inbox DIR), then VPS 3 at offset 45 (--probe).
+offset 30 (--watch --every 90 --offset 30 --inbox DIR), then VPS 3, 4 and 5 at offsets
+45, 60 and 75 (--probe).
 All remote computers hand their
 answers to the main server over SSH. Only the main server sends stock alerts and keeps
 the combined history while it is healthy; the standby takes over during an outage.
@@ -87,7 +88,8 @@ INBOX_STALE_SECONDS = 300
 WORKING_WINDOW = timedelta(minutes=3)
 # One set of server names for check counts, errors, recovery notices and logs.
 SOURCE_NAMES = {"vps": "VPS 1", "github": "GitHub", "mac": "Mac", "backup": "VPS 2",
-                "secondary": "VPS 2", "third": "VPS 3"}
+                "secondary": "VPS 2", "third": "VPS 3", "fourth": "VPS 4", "fifth": "VPS 5"}
+CYCLE_SLOTS = {"github": 0, "secondary": 15, "vps": 30, "third": 45, "fourth": 60, "fifth": 75}
 # A standby server (--standby-of) asks the main server how it is at this many seconds past
 # every minute (--sync), keeping a copy of its stock. It stands in once the main server has
 # not been working for MAIN_SILENT_AFTER; back after a break that long, the main server
@@ -132,6 +134,7 @@ COLOR_EMOJI = {
 STATE_FILE = Path(__file__).resolve().with_name("stock_state.json")
 # One JSON line per check, for stock_report.py: when which configuration was in which store.
 HISTORY_FILE = Path(__file__).resolve().with_name("stock_history.jsonl")
+BACKOFF_FILE = Path(__file__).resolve().with_name("apple_backoff.json")
 # Telegram settings for runs on a Mac or a server, kept outside the project folder
 # so they cannot be uploaded to GitHub with it. Real environment variables win.
 CONFIG_FILE = Path.home() / ".config" / "iphone-stock-watch-hk" / "config.env"
@@ -773,7 +776,7 @@ def check_counts_footer(minutes, counts, sources=()):
         combined["secondary" if source == "backup" else source] += count
     wanted = {"secondary" if s == "backup" else s for s in sources if s}
     wanted.update(s for s in combined if s)
-    shown = [s for s in ("vps", "secondary", "third", "github") if s in wanted]
+    shown = [s for s in ("vps", "secondary", "third", "fourth", "fifth", "github") if s in wanted]
     shown += sorted(wanted - set(shown))
     lines = [f"🔁 Проверок за {minutes} мин: {sum(combined.values())}"]
     for source in shown:
@@ -885,10 +888,16 @@ def next_slot(now, every, offset=0):
 
 
 class Backoff:
-    """When Apple refuses (HTTP 403, 429 or 541), check less: none for 2, 4, 8, then 15 minutes."""
+    """When Apple refuses, pause for 2, 4, 8, then 15 minutes, including across restarts."""
 
     def __init__(self):
         self.refusals, self.until = 0, 0.0
+        saved = read_shared(BACKOFF_FILE)
+        refusals, until = saved.get("refusals"), saved.get("until")
+        if (isinstance(refusals, int) and not isinstance(refusals, bool) and 1 <= refusals <= 100_000
+                and isinstance(until, (int, float)) and not isinstance(until, bool)
+                and math.isfinite(until) and 0 <= until <= time.time() + MAX_REFUSED_PAUSE_SECONDS + 1):
+            self.refusals, self.until = min(refusals, 4), until
 
     def allows(self, moment):
         return moment >= self.until
@@ -902,9 +911,14 @@ class Backoff:
                 self.refusals += 1
                 pause = min(60 * 2 ** self.refusals, MAX_REFUSED_PAUSE_SECONDS)
                 self.until = time.time() + pause
+                try:
+                    write_shared(BACKOFF_FILE, {"refusals": min(self.refusals, 4), "until": self.until}, mode=0o600)
+                except OSError as save_error:
+                    log(f"ERROR: could not save Apple's protective pause: {save_error}", error=True)
                 log(f"Apple refused the request (HTTP {exc.code}); no checks from here for {pause // 60} min.", error=True)
             return None, exc
         self.refusals, self.until = 0, 0.0
+        remove(BACKOFF_FILE)
         return result, None
 
 
@@ -1077,8 +1091,8 @@ class Watcher:
         self.refused[source] = failed and not unreachable(error)
         self.last_check[source] = max(self.last_check.get(source, moment), moment)
         if not failed:
-            if self.every == 60 and self.offset == 30 and source in ("github", "third"):
-                self.slot[source] = {"github": 0, "third": 45}[source]
+            if self.every in (60, 90) and self.offset == 30 and source in CYCLE_SLOTS and CYCLE_SLOTS[source] < self.every:
+                self.slot[source] = CYCLE_SLOTS[source]
             else:
                 self.slot[source] = 0 if self.every == 45 and source == "github" else int(moment.timestamp()) % self.every
 
@@ -1574,7 +1588,7 @@ def sync(shared, stream, out):
             write_shared(shared / f"history-{time.time_ns()}.sync", history_from_json(data["history"]))
         if "check" in data:  # the standby's check in place of another computer, or GitHub's passed on
             check = data["check"]
-            if not isinstance(check, dict) or check.get("source") not in ("backup", "secondary", "third", "github"):
+            if not isinstance(check, dict) or check.get("source") not in ("backup", "secondary", "third", "fourth", "fifth", "github"):
                 raise ValueError("bad check")
             check_from_json(check)
             save_check(shared, check)
@@ -1862,7 +1876,7 @@ def main():
         return run_bot(parts)
     if args.status:
         result = fetch_stock(parts)
-        footer = check_counts_footer(10, recent_check_counts(), ("vps", "secondary", "third", "github"))
+        footer = check_counts_footer(10, recent_check_counts(), ("vps", "secondary", "third", "fourth", "fifth", "github"))
         send_telegram(status_message(result, parts, footer))
         log("Status sent to Telegram.")
         return 0

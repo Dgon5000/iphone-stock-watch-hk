@@ -1,20 +1,20 @@
 #!/bin/bash
 # Install the Apple Store Hong Kong stock watch on a Linux server with systemd
-# (Ubuntu, Debian and similar) as a service that checks every 60 seconds and sends a
+# (Ubuntu, Debian and similar) as a service that checks every 90 seconds and sends a
 # quiet status every 10 minutes, plus a second service that answers /iphone and /report in
-# Telegram. GitHub, VPS 2, VPS 1 and VPS 3 check at :00, :15, :30 and :45 of every minute:
-# one state and checks every 15 seconds. See vps_probe_install.sh for VPS 3.
+# Telegram. GitHub, VPS 2, VPS 1, VPS 3, VPS 4 and VPS 5 check 15 seconds apart:
+# one state and a 90-second cycle. See vps_probe_install.sh for VPS 3, 4 and 5.
 # The second server also takes over if the main watcher stops working.
 # The services start again after reboots or crashes.
 #
 #   sudo bash vps_install.sh             install or update (asks for the Telegram token on the first run)
-#   sudo EVERY=60 OFFSET=30 STATUS_MINUTES=10 bash vps_install.sh   other check times (seconds) and status period (minutes, 0 = none)
+#   sudo EVERY=90 OFFSET=30 STATUS_MINUTES=10 bash vps_install.sh   other check times (seconds) and status period (minutes, 0 = none)
 #   sudo bash vps_install.sh feed-key 'ssh-ed25519 AAAA… github'   let GitHub hand in its checks with this SSH key
 #   sudo bash vps_install.sh standby MAIN_IP    make this server the standby of the main one (prints its key);
 #                                               MAIN_HOST_KEY='ssh-ed25519 AAAA…' gives the main server's host key
 #                                               PARTICIPATE=0 keeps the legacy passive standby mode
 #   sudo bash vps_install.sh sync-key 'ssh-ed25519 AAAA… standby'  on the main server: let the standby ask how it is
-#   sudo bash vps_install.sh probe-key 'ssh-ed25519 AAAA… vps3'  let VPS 3 hand in its checks
+#   sudo bash vps_install.sh probe-key 'ssh-ed25519 AAAA… vps4' fourth  let VPS 4 hand in its checks (default: third)
 #   sudo bash vps_install.sh status      send what is in stock now to Telegram
 #   sudo bash vps_install.sh report      when which configuration was in stock (history report)
 #   sudo bash vps_install.sh uninstall   stop and remove the services and the SSH access (files and settings stay)
@@ -25,7 +25,7 @@ set -euo pipefail
 
 APP="${APP:-/opt/iphone-stock-watch-hk}"
 UNIT_DIR="${UNIT_DIR:-/etc/systemd/system}"
-EVERY="${EVERY:-60}"
+EVERY="${EVERY:-90}"
 OFFSET="${OFFSET:-}"
 PARTICIPATE="${PARTICIPATE:-1}"
 STATUS_MINUTES="${STATUS_MINUTES:-10}"
@@ -83,6 +83,7 @@ fi
 FEED_KEY=""
 SYNC_KEY=""
 PROBE_KEY=""
+PROBE_SOURCE=third
 case "${1:-}" in
   uninstall)
     remove_units
@@ -119,8 +120,13 @@ case "${1:-}" in
     ;;
   probe-key)
     PROBE_KEY="${2:-}"
+    PROBE_SOURCE="${3:-third}"
     if ! [[ "$PROBE_KEY" =~ $KEY_RE ]]; then
-      echo "Нужен открытый ключ ssh-ed25519 VPS 3 в кавычках." >&2
+      echo "Нужен открытый ключ ssh-ed25519 проверяющего VPS в кавычках." >&2
+      exit 1
+    fi
+    if ! [[ "$PROBE_SOURCE" =~ ^(third|fourth|fifth)$ ]]; then
+      echo "Источник probe-key — third, fourth или fifth." >&2
       exit 1
     fi
     ;;
@@ -206,7 +212,8 @@ if [ -n "$SYNC_KEY" ]; then
   printf '%s\n' "$SYNC_KEY" > "$FEED_HOME/.ssh/sync_key.pub"
 fi
 if [ -n "$PROBE_KEY" ]; then
-  printf '%s\n' "$PROBE_KEY" > "$FEED_HOME/.ssh/probe_key.pub"
+  if [ "$PROBE_SOURCE" = third ]; then PROBE_FILE=probe_key.pub; else PROBE_FILE="probe_${PROBE_SOURCE}_key.pub"; fi
+  printf '%s\n' "$PROBE_KEY" > "$FEED_HOME/.ssh/$PROBE_FILE"
 fi
 {
   if [ -f "$FEED_HOME/.ssh/feed_key.pub" ]; then
@@ -217,10 +224,13 @@ fi
     printf 'restrict,command="%s -I %s/check_stock.py --sync %s" %s\n' \
       "$PYTHON" "$FEED_LIB" "$INBOX" "$(head -n 1 "$FEED_HOME/.ssh/sync_key.pub")"
   fi
-  if [ -f "$FEED_HOME/.ssh/probe_key.pub" ]; then
-    printf 'restrict,command="%s -I %s/check_stock.py --ingest %s --source third" %s\n' \
-      "$PYTHON" "$FEED_LIB" "$INBOX" "$(head -n 1 "$FEED_HOME/.ssh/probe_key.pub")"
-  fi
+  for probe_source in third fourth fifth; do
+    if [ "$probe_source" = third ]; then probe_file=probe_key.pub; else probe_file="probe_${probe_source}_key.pub"; fi
+    if [ -f "$FEED_HOME/.ssh/$probe_file" ]; then
+      printf 'restrict,command="%s -I %s/check_stock.py --ingest %s --source %s" %s\n' \
+        "$PYTHON" "$FEED_LIB" "$INBOX" "$probe_source" "$(head -n 1 "$FEED_HOME/.ssh/$probe_file")"
+    fi
+  done
 } > "$FEED_HOME/.ssh/authorized_keys.new"
 if [ -s "$FEED_HOME/.ssh/authorized_keys.new" ]; then
   chmod 644 "$FEED_HOME/.ssh/authorized_keys.new" "$FEED_HOME"/.ssh/*.pub

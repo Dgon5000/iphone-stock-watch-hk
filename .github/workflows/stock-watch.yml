@@ -1,6 +1,7 @@
 name: iPhone Stock Watch (Apple Store Hong Kong)
 
-# Four slots per minute: GitHub at :00, VPS 2 at :15, VPS 1 at :30, VPS 3 at :45.
+# Six slots per 90-second cycle: GitHub at 0, VPS 2 at 15, VPS 1 at 30,
+# VPS 3 at 45, VPS 4 at 60 and VPS 5 at 75 seconds past each cycle boundary.
 # Each remote answer is handed to the main server over SSH. Only the server sends to
 # Telegram and keeps the history, so nothing arrives twice.
 #
@@ -68,7 +69,7 @@ jobs:
             cat ~/.ssh/feed2 >> ~/.ssh/config && rm ~/.ssh/feed2
           fi
 
-      - name: Check Apple at :00 of every minute and hand each check to the server
+      - name: Check Apple every 90 seconds and hand each check to the server
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -84,7 +85,7 @@ jobs:
             > "$RUNNER_TEMP/line-up.log" 2>&1 < /dev/null &
           backup=()
           if [ -n "$FEED_HOST_BACKUP" ]; then backup=(--backup feed2); fi
-          python3 -u check_stock.py --probe feed "${backup[@]}" --every 60 --offset 0 --minutes 330
+          python3 -u check_stock.py --probe feed "${backup[@]}" --every 90 --offset 0 --minutes 330
 
       - name: Start the next run unless it is lined up
         env:

@@ -566,7 +566,7 @@ class AlertScenarios(Base):
             self.assertEqual(self.cs.main(), 0)
         [message] = self.world.sent()
         self.assertTrue(message['text'].endswith(
-            '🔁 Проверок за 10 мин: 3\n• <b>VPS 1</b> — 1\n• <b>VPS 2</b> — 1\n• <b>VPS 3</b> — 0\n• <b>GitHub</b> — 1'))
+            '🔁 Проверок за 10 мин: 3\n• <b>VPS 1</b> — 1\n• <b>VPS 2</b> — 1\n• <b>VPS 3</b> — 0\n• <b>VPS 4</b> — 0\n• <b>VPS 5</b> — 0\n• <b>GitHub</b> — 1'))
         self.assertEqual((state.read_bytes(), history.read_bytes()), before)
 
     def test_schedule_parsing(self):
@@ -1360,7 +1360,7 @@ class Report(Base):
         self.assertEqual(entries[1]["in_stock"], {})
 
     def test_journal_import_recognizes_current_and_legacy_server_names(self):
-        names = ("VPS 1", "VPS 2", "VPS 3", "GitHub", "VPS", "Запасной VPS", "Дополнительный VPS")
+        names = ("VPS 1", "VPS 2", "VPS 3", "VPS 4", "VPS 5", "GitHub", "VPS", "Запасной VPS", "Дополнительный VPS")
         lines = [
             f"[2026-10-03 18:00:{i:02d} HKT] {name}: 6 stores × 12 models checked — iPhone 18 Pro Max 2TB Silver: ifc mall"
             for i, name in enumerate(names)

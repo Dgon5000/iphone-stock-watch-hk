@@ -1,5 +1,5 @@
 #!/bin/bash
-# Install VPS 3 as a checking-only service. It sends results to the main VPS or VPS 2;
+# Install VPS 3, 4 or 5 as a checking-only service. It sends results to VPS 1 or VPS 2;
 # it never takes over Telegram polling or stock alerts.
 # Supply verified MAIN_HOST_KEY and BACKUP_HOST_KEY (ssh-ed25519 public host keys).
 set -euo pipefail
@@ -8,8 +8,15 @@ APP="${APP:-/opt/iphone-stock-watch-hk}"
 UNIT_DIR="${UNIT_DIR:-/etc/systemd/system}"
 MAIN_HOST="${MAIN_HOST:-VPS1_IP}"
 BACKUP_HOST="${BACKUP_HOST:-VPS2_IP}"
-EVERY="${EVERY:-60}"
-OFFSET="${OFFSET:-45}"
+EVERY="${EVERY:-90}"
+SOURCE="${SOURCE:-third}"
+case "$SOURCE" in
+  third) PROBE_NAME="VPS 3"; DEFAULT_OFFSET=45 ;;
+  fourth) PROBE_NAME="VPS 4"; DEFAULT_OFFSET=60 ;;
+  fifth) PROBE_NAME="VPS 5"; DEFAULT_OFFSET=75 ;;
+  *) echo "SOURCE — third, fourth или fifth." >&2; exit 1 ;;
+esac
+OFFSET="${OFFSET:-$DEFAULT_OFFSET}"
 NAME=iphone-stock-watch-hk
 RUN_USER=stockwatch
 SRC="$(cd "$(dirname "$0")" && pwd)"
@@ -29,6 +36,10 @@ if ! [[ "$MAIN_HOST" =~ $HOST_RE && "$BACKUP_HOST" =~ $HOST_RE \
 fi
 if [ -f "$UNIT_DIR/$NAME.service" ] && ! grep -q -- '--probe feed' "$UNIT_DIR/$NAME.service"; then
   echo "На сервере уже настроена другая роль iPhone-проекта; её не меняю." >&2
+  exit 1
+fi
+if [ -f "$UNIT_DIR/$NAME.service" ] && ! grep -q -- "--source $SOURCE" "$UNIT_DIR/$NAME.service"; then
+  echo "На сервере уже настроен другой проверяющий узел; его источник не меняю." >&2
   exit 1
 fi
 for program in python3 ssh ssh-keygen systemctl; do
@@ -53,7 +64,7 @@ fi
 chown "$RUN_USER:$RUN_USER" "$APP/config.env"
 chmod 600 "$APP/config.env"
 if [ ! -f "$APP/.ssh/feed_key" ]; then
-  ssh-keygen -q -t ed25519 -N '' -C iphone-stock-vps3-feed -f "$APP/.ssh/feed_key"
+  ssh-keygen -q -t ed25519 -N '' -C "iphone-stock-${SOURCE}-feed" -f "$APP/.ssh/feed_key"
 fi
 printf '%s %s\n%s %s\n' "$MAIN_HOST" "$MAIN_HOST_KEY" "$BACKUP_HOST" "$BACKUP_HOST_KEY" > "$APP/.ssh/known_hosts"
 cat > "$APP/.ssh/config" <<EOF
@@ -81,7 +92,7 @@ chmod 644 "$APP/.ssh/feed_key.pub" "$APP/.ssh/known_hosts"
 
 cat > "$UNIT_DIR/$NAME.service" <<EOF
 [Unit]
-Description=VPS 3 Apple Store Hong Kong iPhone stock probe
+Description=$PROBE_NAME Apple Store Hong Kong iPhone stock probe
 Wants=network-online.target
 After=network-online.target
 
@@ -90,7 +101,7 @@ Type=simple
 User=$RUN_USER
 WorkingDirectory=$APP
 EnvironmentFile=$APP/config.env
-ExecStart=$PYTHON -u $APP/check_stock.py --probe feed --backup feed2 --every $EVERY --offset $OFFSET --source third
+ExecStart=$PYTHON -u $APP/check_stock.py --probe feed --backup feed2 --every $EVERY --offset $OFFSET --source $SOURCE
 Restart=always
 RestartSec=30
 NoNewPrivileges=yes
@@ -107,6 +118,6 @@ if [ "${START_SERVICE:-1}" = 1 ]; then
   systemctl enable "$NAME.service"
   systemctl restart "$NAME.service"
 fi
-echo "VPS 3: проверка каждые $EVERY с со сдвигом $OFFSET с; результаты идут основному VPS или VPS 2."
+echo "$PROBE_NAME: проверка каждые $EVERY с со сдвигом $OFFSET с; результаты идут VPS 1 или VPS 2."
 echo "Добавьте этот публичный ключ обоим получателям:"
 cat "$APP/.ssh/feed_key.pub"
