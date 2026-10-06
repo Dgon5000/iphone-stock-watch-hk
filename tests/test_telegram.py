@@ -10,6 +10,8 @@ import re
 import shutil
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from html.parser import HTMLParser
@@ -878,6 +880,63 @@ class TestMessage(Base):
         self.world.apple_errors = [HTTPError("u", 541, "x", {}, io.BytesIO(b""))]
         self.cs.send_test_message(list(PRO_MAX))
         self.assertIn("⚠️ Не удалось проверить наличие: Apple returned HTTP 541", self.world.sent()[0]["text"])
+
+
+class TelegramDelivery(Base):
+    """Now and then a connection to Telegram hangs for a minute (seen from VPS 1 1–4 times a day)."""
+
+    def test_a_hung_connection_is_given_up_and_the_message_sent_once_more(self):
+        timeouts, telegram = [], self.world.telegram
+        failures = [URLError(TimeoutError("The handshake operation timed out"))]
+        self.world.telegram = lambda url, data: (_ for _ in ()).throw(failures.pop()) if failures else telegram(url, data)
+
+        def urlopen(req, timeout=None, context=None):
+            timeouts.append(timeout)
+            return self.world.urlopen(req, timeout, context)
+
+        with mock.patch.object(self.cs, "urlopen", urlopen):
+            self.cs.send_telegram("🟢 Появились")
+        self.assertEqual(timeouts, [10, 10])
+        self.assertEqual(len(self.world.sent()), 1)
+        self.assertIn("Telegram did not answer (The handshake operation timed out); trying again.", sys.stdout.getvalue())
+
+    def test_a_second_failed_connection_is_an_error_without_the_token(self):
+        self.world.telegram = lambda url, data: (_ for _ in ()).throw(URLError(ConnectionResetError(104, "Connection reset by peer")))
+        with self.assertRaisesRegex(RuntimeError, "Could not reach Telegram") as caught:
+            self.cs.send_telegram("🟢 Появились")
+        self.assertNotIn("SECRET", str(caught.exception))
+
+    def test_a_slow_status_holds_nothing_up_and_its_checks_are_counted_once(self):
+        hkt = timezone(timedelta(hours=8))
+        release, calls = threading.Event(), []
+        self.addCleanup(release.set)
+
+        def send(message, silent=False):
+            calls.append(message)
+            if len(calls) == 1:
+                release.wait(10)  # Telegram hangs on the first status
+
+        def check(status, hhmmss, source):
+            moment = datetime(2026, 10, 3, *map(int, hhmmss.split(":")), tzinfo=hkt)
+            status.after_check(self.cs.CheckResult(6, {}, [], [], moment), [], False, False, source, ("vps", "github"))
+
+        status = self.cs.Status(10)
+        with mock.patch.object(self.cs, "send_telegram", send), mock.patch.object(self.cs, "STATUS_SEND_WAIT", 0.05):
+            check(status, "10:00:00", "vps")
+            check(status, "10:00:15", "github")
+            started = time.monotonic()
+            check(status, "10:10:00", "vps")      # the status of 10:00–10:10 hangs
+            self.assertLess(time.monotonic() - started, 2)
+            check(status, "10:10:15", "github")   # counted for the next status; no second send meanwhile
+            self.assertEqual(len(calls), 1)
+            release.set()
+            self.assertTrue(status.sending[0].wait(5))
+            check(status, "10:10:30", "vps")
+            check(status, "10:20:00", "github")   # the status of 10:10–10:20
+        self.assertEqual(len(calls), 2)
+        self.assertIn("🔁 Проверок за 10 мин: 2", check_html(calls[0]))
+        self.assertIn("🔁 Проверок за 10 мин: 3", check_html(calls[1]))
+        self.assertEqual(sys.stdout.getvalue().count("Status sent to Telegram."), 2)
 
 
 class TelegramSetup(Base):

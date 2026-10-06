@@ -87,6 +87,12 @@ OWN_ANSWER_WAIT = 5
 # --watch --inbox looks for the checks other computers hand in this often, so each one is
 # handled, and any alert sent, within this many seconds of arriving.
 INBOX_POLL_SECONDS = 0.2
+# Telegram usually answers within a second, but now and then a connection hangs for a minute.
+# A message is then given up after TELEGRAM_SEND_TIMEOUT and sent once more on a fresh
+# connection. The quiet status is waited for STATUS_SEND_WAIT; a slower one finishes in the
+# background, so it never holds up the checks and the alerts.
+TELEGRAM_SEND_TIMEOUT = 10
+STATUS_SEND_WAIT = 3
 # When Apple refuses requests (HTTP 403, 429, or 541 — Apple's own "too many requests from
 # this address"), the computer pauses its checks for 2, 4, 8 and then at most 15 minutes
 # instead of insisting.
@@ -456,6 +462,9 @@ def telegram_api(token, method, payload=None, timeout=30, document=None):
             # "from None": the chained exception would carry the URL, which contains the bot token.
             raise RuntimeError(f'Telegram {method} failed: HTTP {exc.code} {reply.get("description", "")}'.strip()) from None
         except OSError as exc:
+            if attempt == 1:  # a hung or reset connection: a fresh one usually works at once
+                log(f"Telegram did not answer ({getattr(exc, 'reason', exc)}); trying again.")
+                continue
             raise RuntimeError(f"Could not reach Telegram: {getattr(exc, 'reason', exc)}") from None
         except Exception as exc:  # e.g. http.client.InvalidURL, whose message would contain the token
             raise RuntimeError(f"Telegram {method} request failed: {type(exc).__name__}") from None
@@ -520,7 +529,7 @@ def send_telegram(text, silent=False, chat_ids=None, buttons=None):
             }
             if buttons and i == len(chunks) - 1:
                 payload["reply_markup"] = {"inline_keyboard": buttons}
-            telegram_api(token, "sendMessage", payload)
+            telegram_api(token, "sendMessage", payload, timeout=TELEGRAM_SEND_TIMEOUT)
 
 
 def tell(text):
@@ -824,13 +833,38 @@ def recent_check_counts(minutes=10, now=None):
 class Status:
     """A quiet summary of everything watched every `minutes` minutes on the clock (10:00,
     10:10, …): sent with the first fresh check of a new period, even if stock changed.
-    A failed delivery is retried with the next fresh check, keeping the check counts."""
+    It goes out on a thread of its own (see STATUS_SEND_WAIT), so a slow Telegram never holds
+    up the checks. A failed delivery is retried with the next fresh check, keeping the check
+    counts."""
 
     def __init__(self, minutes):
         self.minutes = minutes
         self.period = None
         self.since = None  # time of the first check counted
         self.counts = Counter()
+        self.sending = None  # while a status is on its way: (finished, outcome, period, moment, counts in it)
+
+    def settle(self):
+        """Take in the outcome of the status on its way, once it is known."""
+        if self.sending is None or not self.sending[0].is_set():
+            return
+        _, outcome, period, moment, counted = self.sending
+        self.sending = None
+        if outcome == [True]:
+            self.period, self.since = period, moment
+            self.counts -= counted  # checks counted meanwhile belong to the next status
+
+    @staticmethod
+    def send(message, finished, outcome):
+        try:
+            send_telegram(message, silent=True)
+            outcome.append(True)
+            log("Status sent to Telegram.")
+        except Exception as exc:
+            outcome.append(False)
+            log(f"ERROR: could not send the status: {exc}", error=True)
+        finally:
+            finished.set()
 
     def after_check(self, result, parts, reported, dry_run, source=None, sources=()):
         """Call with every fresh answer from Apple; `sources` are all computers that check."""
@@ -840,23 +874,21 @@ class Status:
         period = int(moment.timestamp() // (self.minutes * 60))
         if self.period is None:
             self.period, self.since = period, moment
-        if period != self.period:
+        self.settle()
+        if period != self.period and self.sending is None:
             minutes = max(1, round((moment - self.since).total_seconds() / 60))
             footer = check_counts_footer(minutes, self.counts, sources)
             message = status_message(result, parts, footer)
-            delivered = dry_run
             if dry_run:
                 print(f"--- dry run, status not sent ---\n{message}\n---", flush=True)
-            else:
-                try:
-                    send_telegram(message, silent=True)
-                    delivered = True
-                    log("Status sent to Telegram.")
-                except Exception as exc:
-                    log(f"ERROR: could not send the status: {exc}", error=True)
-            if delivered:
                 self.period, self.since = period, moment
                 self.counts.clear()
+            else:
+                finished, outcome = threading.Event(), []
+                self.sending = (finished, outcome, period, moment, Counter(self.counts))
+                threading.Thread(target=self.send, args=(message, finished, outcome), daemon=True).start()
+                finished.wait(STATUS_SEND_WAIT)
+                self.settle()
         self.counts[source] += 1
 
 

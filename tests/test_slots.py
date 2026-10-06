@@ -1168,6 +1168,43 @@ class SixComputerCycle(FourComputerCycle):
         self.assertIn('GitHub: older than the last check', log)
         self.assertEqual(len([c for c in self.history() if 'in_stock' in c]), 5)
 
+    def test_a_status_stuck_in_telegram_does_not_hold_up_an_alert(self):
+        # Telegram hangs on the quiet status of 10:10 until 10:10:40. VPS 5's check of
+        # 10:10:15 finds new stock: its alert goes out at once, and the status comes later.
+        self.clock.now = hkt('09:08:59')
+        self.next_checks = {s: hkt('09:09:00') + off for s, off in self.cs.CYCLE_SLOTS.items() if s != 'vps'}
+        self.github = lambda moment: {('R499', U)} if moment >= hkt('09:10:15') else set()
+        release, sent, telegram = threading.Event(), [], self.world.telegram
+        self.addCleanup(release.set)
+
+        def slow(url, data):
+            silent = json.loads(data).get('disable_notification')
+            if silent:
+                release.wait(10)
+            sent.append((self.clock.now, silent))
+            return telegram(url, data)
+
+        def answer(now):
+            if now >= hkt('09:10:40') and not release.is_set():
+                release.set()
+                for _ in range(500):
+                    if len(sent) >= 2:
+                        break
+                    threading.Event().wait(0.01)
+
+        self.world.telegram = slow
+        self.clock.hooks.append(answer)
+        self.clock.hooks.append(lambda now: (_ for _ in ()).throw(Stop()) if now >= hkt('09:10:50') else None)
+        with mock.patch.object(self.cs, 'STATUS_SEND_WAIT', 0.05), self.assertRaises(Stop):
+            self.cs.run_slots(list(PRO_MAX), 90, 30, False, 10, self.inbox, 'vps')
+        (alerted, loud), (statused, quiet) = sent
+        self.assertFalse(loud)
+        self.assertTrue(quiet)
+        self.assertLessEqual(alerted, hkt('09:10:16') + 0.2)
+        self.assertGreaterEqual(statused, hkt('09:10:40'))
+        self.assertIn('🟢 Появились', self.texts()[0])
+        self.assertIn('📋 Наличие', self.texts()[1])
+
     def test_an_error_on_the_own_check_thread_reaches_the_loop(self):
         with mock.patch.object(self.cs, 'fetch_stock', side_effect=Stop()), self.assertRaises(Stop):
             self.cs.run_slots(list(PRO_MAX), 90, 30, False, 0, self.inbox, 'vps')
