@@ -517,7 +517,7 @@ class MainServer(SharedBase):
         self.run_until(hkt("10:02:10"))
         status = json.loads((self.inbox / "status.sync").read_text())
         self.assertEqual(status, {"alive": "2026-10-03T02:02:00+00:00", "checked": "2026-10-03T02:02:00+00:00",
-                                  "available": SILVER, "present": ["github", "vps"]})
+                                  "available": SILVER, "present": list(self.cs.CYCLE_SLOTS)})  # none silent for 135 s yet
         self.assertEqual((self.inbox / "status.sync").stat().st_mode & 0o777, 0o644)  # the --sync user reads it
 
     def test_back_after_a_break_it_waits_two_minutes_then_reports(self):
@@ -1125,6 +1125,12 @@ class SharedCycle(SixComputerCycle):
         self.assertEqual(self.cs.plan_from_json(['github', 'mac', 'vps']), ['github', 'vps'])
         self.assertIsNone(self.cs.plan_from_json('vps'))
 
+    def test_a_change_of_the_cycle_never_makes_anyone_look_silent(self):
+        # From the 75-s cycle back to the 90-s one, a computer's next check can come up to a full
+        # cycle plus MIN_OWN_GAP after its last; with a slow delivery that still counts as heard.
+        longest = 90 + self.cs.MIN_OWN_GAP + 5
+        self.assertLess(longest, self.cs.OUT_AFTER.total_seconds())
+
     def test_who_is_out_and_who_is_back(self):
         self.clock.now = hkt('10:00:00')
         watcher = self.cs.Watcher(list(PRO_MAX), False, 0, 'vps', shared=self.inbox, every=90, offset=30)
@@ -1138,30 +1144,30 @@ class SharedCycle(SixComputerCycle):
         for source in everyone:
             if source != 'fourth':
                 check(source, '10:01:30')
-        self.assertEqual(watcher.present(utc('10:01:44')), everyone)
-        self.assertEqual(watcher.present(utc('10:01:46')), self.FIVE)  # nothing from VPS 4 for over 105 s
-        check('fifth', '10:01:50', 'Apple returned HTTP 541; not treating this as out of stock.')
-        self.assertNotIn('fifth', watcher.present(utc('10:01:50')))  # refused: out at once, while it pauses
-        check('third', '10:01:51', 'Could not reach Apple: timed out; not treating this as out of stock.')
-        self.assertIn('third', watcher.present(utc('10:01:51')))
-        check('third', '10:01:52', 'Could not reach Apple: timed out; not treating this as out of stock.')
-        self.assertNotIn('third', watcher.present(utc('10:01:52')))  # twice in a row
-        check('github', '10:01:53', 'Apple returned HTTP 503; not treating this as out of stock.')
-        self.assertIn('github', watcher.present(utc('10:01:53')))  # Apple's other errors do not pause it
+        self.assertEqual(watcher.present(utc('10:02:14')), everyone)  # 134 s after the start
+        self.assertEqual(watcher.present(utc('10:02:16')), self.FIVE)  # nothing from VPS 4 for over 135 s
+        check('fifth', '10:02:20', 'Apple returned HTTP 541; not treating this as out of stock.')
+        self.assertNotIn('fifth', watcher.present(utc('10:02:20')))  # refused: out at once, while it pauses
+        check('third', '10:02:21', 'Could not reach Apple: timed out; not treating this as out of stock.')
+        self.assertIn('third', watcher.present(utc('10:02:21')))
+        check('third', '10:02:22', 'Could not reach Apple: timed out; not treating this as out of stock.')
+        self.assertNotIn('third', watcher.present(utc('10:02:22')))  # twice in a row
+        check('github', '10:02:23', 'Apple returned HTTP 503; not treating this as out of stock.')
+        self.assertIn('github', watcher.present(utc('10:02:23')))  # Apple's other errors do not pause it
         for source in ('third', 'fourth', 'fifth'):
-            check(source, '10:02:00')
-        self.assertEqual(watcher.present(utc('10:02:00')), everyone)  # each back with its next good check
+            check(source, '10:02:30')
+        self.assertEqual(watcher.present(utc('10:02:30')), everyone)  # each back with its next good check
         watcher.backoff = self.cs.Backoff()
         watcher.backoff.until = self.clock.now + 120  # Apple made this server pause
         self.assertNotIn('vps', watcher.present(utc('10:02:00')))
 
     def test_the_main_server_closes_up_when_a_computer_goes_silent(self):
-        # VPS 4 checks at 10:01:00 and then no more: from 10:02:46 the five close up.
+        # VPS 4 checks at 10:01:00 (heard at 10:01:01) and then no more: from 10:03:16 the five close up.
         self.clock.hooks.append(lambda now: self.next_checks.__setitem__('fourth', math.inf) if now >= hkt('10:01:02') else None)
         self.clock.hooks.append(lambda now: (_ for _ in ()).throw(Stop()) if now >= hkt('10:07:00') else None)
         with self.assertRaises(Stop):
             self.cs.run_slots(list(PRO_MAX), 90, 30, False, 0, self.inbox, 'vps')
-        first = self.cs.next_slot(hkt('10:02:46'), 75, 30)
+        first = self.cs.next_slot(hkt('10:01:01') + self.cs.OUT_AFTER.total_seconds(), 75, 30)
         expected = [hkt('10:00:30'), hkt('10:02:00')] + [first + 75 * i for i in range(5) if first + 75 * i < hkt('10:07:00')]
         self.assertEqual(self.world.request_times, expected)
         self.assertEqual(json.loads((self.inbox / 'status.sync').read_text())['present'], self.FIVE)

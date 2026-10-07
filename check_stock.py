@@ -129,10 +129,11 @@ MAX_SYNC_BYTES = 16 * 1024 * 1024
 # server works out who takes part (Watcher.present) and says so in STATUS_SYNC and in every
 # answer to --ingest and --sync; a computer that has heard nothing for PLAN_TTL goes back to
 # its own place. When the cycle changes, a computer still waits MIN_OWN_GAP seconds after its
-# last request.
+# last request, so its checks may then come up to a full cycle (90 s) plus MIN_OWN_GAP apart:
+# OUT_AFTER leaves room for that and for a slow delivery.
 CHECK_SPACING = 15
 MIN_EVERY = 75
-OUT_AFTER = timedelta(seconds=105)
+OUT_AFTER = timedelta(seconds=135)
 UNREACHABLE_AFTER = 2
 PLAN_TTL = timedelta(minutes=5)
 MIN_OWN_GAP = 30
