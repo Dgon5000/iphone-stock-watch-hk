@@ -119,14 +119,24 @@ MAIN_SILENT_AFTER = timedelta(minutes=3)
 RETURN_WAIT = timedelta(minutes=2)
 HANDBACK_QUIET = timedelta(seconds=75)  # after a handback, until the standby has stood aside
 MAX_SYNC_BYTES = 16 * 1024 * 1024
-# While the main server works, the standby also checks in place of a computer that could
-# not reach Apple at all (network, timeouts) FILL_AFTER times in a row, or of GitHub when
-# nothing came from it for FILL_AFTER_SILENCE — never because Apple refused or answered
-# with an error: a refusal means "less often", not "from elsewhere". Its checks go to the
-# main server, which asks for them in STATUS_SYNC ("fill").
-FILL_AFTER = 2
-FILL_AFTER_SILENCE = timedelta(seconds=150)
-STATUS_SYNC = "status.sync"  # the main server: alive when, last check, stock, checks wanted
+# The computers in CYCLE_SLOTS share the checking. With n of them taking part, each checks
+# every max(n × CHECK_SPACING, MIN_EVERY) seconds at its own evenly spaced place (see place),
+# so Apple is asked every CHECK_SPACING seconds while five or six take part, and never more
+# often than every MIN_EVERY seconds from one computer, lest Apple refuse the others in turn.
+# A computer that is out — nothing heard from it for OUT_AFTER, Apple refused its last check
+# (it pauses, see Backoff) or it could not reach Apple UNREACHABLE_AFTER times in a row — is
+# left out at once and the others close up; its next good check takes it back. The main
+# server works out who takes part (Watcher.present) and says so in STATUS_SYNC and in every
+# answer to --ingest and --sync; a computer that has heard nothing for PLAN_TTL goes back to
+# its own place. When the cycle changes, a computer still waits MIN_OWN_GAP seconds after its
+# last request.
+CHECK_SPACING = 15
+MIN_EVERY = 75
+OUT_AFTER = timedelta(seconds=105)
+UNREACHABLE_AFTER = 2
+PLAN_TTL = timedelta(minutes=5)
+MIN_OWN_GAP = 30
+STATUS_SYNC = "status.sync"  # the main server: alive when, last check, stock, who takes part
 HANDBACK_SYNC = "handback.sync"  # the standby's stock after standing in
 HISTORY_SYNC = "history-*.sync"  # the standby's checks while standing in
 # Telegram bot (--bot): commands in the bot's menu, commands older than this are ignored
@@ -262,6 +272,13 @@ def unreachable(error):
     """Whether a check failed because the computer could not reach Apple (network, timeouts),
     not because Apple answered with an error (see request_stores)."""
     return str(error).startswith("Could not reach Apple")
+
+
+def refused(error):
+    """Whether Apple refused the check (REFUSED_CODES), so that the computer pauses (see
+    Backoff). `error` is the exception here, or its text from another computer."""
+    codes = "|".join(str(code) for code in REFUSED_CODES)
+    return getattr(error, "code", None) in REFUSED_CODES or bool(re.search(rf"\bHTTP ({codes})\b", str(error)))
 
 
 def read_state():
@@ -932,6 +949,40 @@ def next_slot(now, every, offset=0):
     return (math.floor((now - offset) / every) + 1) * every + offset
 
 
+def place(present, source):
+    """(every, offset) of `source` in the cycle shared by the `present` computers (see
+    CHECK_SPACING), or None if it does not take part."""
+    order = [s for s in sorted(CYCLE_SLOTS, key=CYCLE_SLOTS.get) if s in (present or ())]
+    if source not in order:
+        return None
+    every = max(CHECK_SPACING * len(order), MIN_EVERY)
+    return every, order.index(source) * every / len(order)
+
+
+def shares_cycle(source, every, offset):
+    """Whether `source` checks at its own place of the full cycle (CYCLE_SLOTS), and so closes
+    up with the others when one of them is out (see CHECK_SPACING)."""
+    return CYCLE_SLOTS.get(source) == offset and every == CHECK_SPACING * len(CYCLE_SLOTS)
+
+
+def plan_from_json(value):
+    """The computers taking part, as the main server named them (see CHECK_SPACING), or None."""
+    if isinstance(value, list) and all(isinstance(source, str) for source in value):
+        return [source for source in value if source in CYCLE_SLOTS]
+    return None
+
+
+def describe_plan(present, source):
+    """For the log: who takes part, who is out, and how often this computer checks."""
+    out = [source_name(s) for s in CYCLE_SLOTS if s not in present]
+    mine = place(present, source)
+    text = f"Taking part: {', '.join(source_name(s) for s in present) or 'nobody'}"
+    text += f" ({', '.join(out)} out)" if out else ""
+    if mine:
+        text += f"; a check every {mine[0] / len(present):g} s, from here every {mine[0]:g} s, {mine[1]:g} s into the cycle"
+    return text + "."
+
+
 class Backoff:
     """When Apple refuses, pause for 2, 4, 8, then 15 minutes, including across restarts."""
 
@@ -1093,12 +1144,15 @@ class Watcher:
         self.latest = None  # Apple's time of the newest check acted upon
         self.acted = {}  # per computer, Apple's time of its newest check acted upon
         self.stuck = set()  # inbox files that could not be removed
-        # For fills(): per computer, checks in a row that could not reach Apple, whether Apple
-        # refused its last check, when it last checked, and the second of the minute it checks at.
-        self.unreachable = Counter()
+        # For present(): per computer, when it was last heard from (by this clock), whether
+        # Apple refused its last check, and its checks in a row that could not reach Apple.
+        # Every computer of the cycle counts as heard at the start, so that none is left out
+        # before it had the time to check.
+        start = utc_now()
+        self.heard = {source: start for source in CYCLE_SLOTS}
         self.refused = {}
-        self.last_check = {}
-        self.slot = {}
+        self.unreachable = Counter()
+        self.backoff = None  # this computer's own (run_slots sets it): out while Apple makes it pause
         self.wait_until = None  # back after a break: report changes only after the standby's stock
         alive = parse_utc(read_shared(self.shared / STATUS_SYNC).get("alive")) if self.shared else None
         if alive and utc_now() - alive > MAIN_SILENT_AFTER:
@@ -1119,8 +1173,7 @@ class Watcher:
             "alive": utc_now().isoformat(timespec="seconds"),
             "checked": self.latest.isoformat(timespec="seconds") if self.latest else None,
             "available": self.state.get("available") or [],
-            "fill": self.fills(utc_now()),
-            "every": self.every,
+            "present": self.present(utc_now()),
         }
         try:
             write_shared(self.shared / STATUS_SYNC, status, mode=0o644)
@@ -1159,30 +1212,28 @@ class Watcher:
                 log(f"Added the standby's {len(lines)} check(s) to the history.")
 
     def note(self, source, moment, result, error):
-        """How each computer's checks go, for fills(). A standby's own are not its business."""
-        if source in ("backup", "secondary"):
-            return
+        """How each computer's checks go, for present()."""
         failed = result is None
+        self.heard[source] = utc_now()
+        self.refused[source] = failed and refused(error)
         self.unreachable[source] = self.unreachable[source] + 1 if failed and unreachable(error) else 0
-        self.refused[source] = failed and not unreachable(error)
-        self.last_check[source] = max(self.last_check.get(source, moment), moment)
-        if not failed:
-            if self.every in (60, 90) and self.offset == 30 and source in CYCLE_SLOTS and CYCLE_SLOTS[source] < self.every:
-                self.slot[source] = CYCLE_SLOTS[source]
-            else:
-                self.slot[source] = 0 if self.every == 45 and source == "github" else int(moment.timestamp()) % self.every
 
-    def fills(self, now):
-        """The checks a standby should make in place of a computer that cannot (FILL_AFTER), as
-        [{"source": "github", "offset": 0}], offset in this watcher's checking cycle."""
-        wanted = []
-        for source, last in self.last_check.items():
-            failing = self.unreachable[source] >= FILL_AFTER
-            silent = source != self.source and not self.refused.get(source) and now - last >= FILL_AFTER_SILENCE
-            offset = self.offset if source == self.source else self.slot.get(source)
-            if (failing or silent) and offset is not None:
-                wanted.append({"source": source, "offset": offset})
-        return wanted
+    def present(self, now):
+        """The computers of CYCLE_SLOTS that take part in the checking now (see CHECK_SPACING)."""
+        taking = []
+        for source in CYCLE_SLOTS:
+            if source == self.source:
+                out = self.backoff is not None and not self.backoff.allows(time.time())
+            else:
+                heard = self.heard.get(source)
+                out = heard is None or now - heard > OUT_AFTER or self.refused.get(source)
+            if not out and self.unreachable[source] < UNREACHABLE_AFTER:
+                taking.append(source)
+        return taking
+
+    def following(self, now):
+        """The computers taking part as this computer goes by, or None: then it keeps its own place."""
+        return self.present(now)
 
     def record(self, result, error, source, moment):
         return record_history(result, error, source, moment)
@@ -1265,10 +1316,10 @@ class Standby(Watcher):
     When the main server has not been working for MAIN_SILENT_AFTER it checks and reports
     itself, also handling GitHub's checks (which then come here); when the main server works
     again it hands back its stock and its checks and stands aside.
-    While the main server works, it also checks in place of a computer the main server asks
-    for (see FILL_AFTER), and passes on GitHub's checks that could not reach the main server.
-    With --participate it also makes regular checks in its own slot, handing them to the
-    main server without sending Telegram alerts until it needs to stand in."""
+    While the main server works, it passes on the checks that could not reach the main server,
+    and with --participate it also checks at its own place of the cycle the main server names
+    (see CHECK_SPACING), handing its checks to the main server without sending Telegram alerts
+    until it needs to stand in. Standing in, it works out the cycle itself."""
 
     def __init__(self, parts, dry_run, status_minutes, source, main, participate=False, inbox=None,
                  every=60, offset=0):
@@ -1279,11 +1330,33 @@ class Standby(Watcher):
         self.active = False
         self.down_since = None
         self.history = []  # checks made while standing in, for the main server's history
-        self.fill = {}  # second of the minute -> the computer to check in place of
-        self.fill_every = 60  # legacy main servers did not publish their cycle length
+        self.main_plan, self.main_plan_at = None, None  # who takes part, as the main server last said
 
     def checking(self):
         return self.active or self.participate
+
+    def following(self, now):
+        if self.active:
+            return self.present(now)
+        if self.main_plan is not None and now - self.main_plan_at < PLAN_TTL:
+            return self.main_plan
+        return None
+
+    def take_plan(self, reply):
+        plan = plan_from_json((reply or {}).get("present"))
+        if plan is not None:
+            self.main_plan, self.main_plan_at = plan, utc_now()
+
+    def beat(self):
+        """While standing in, say who takes part in the inbox (STATUS_SYNC, which --ingest here
+        reads), so that the computers that hand in their checks here close up too."""
+        if not self.active or not self.inbox or self.dry_run:
+            return
+        status = {"alive": utc_now().isoformat(timespec="seconds"), "present": self.present(utc_now())}
+        try:
+            write_shared(self.inbox / STATUS_SYNC, status, mode=0o644)
+        except OSError as exc:
+            log(f"ERROR: could not write {STATUS_SYNC}: {exc}", error=True)
 
     def handle(self, source, moment, result=None, error=None):
         if self.active:
@@ -1293,8 +1366,9 @@ class Standby(Watcher):
             return
         data = check_to_json(source, result, error, moment)
         if self.down_since is None:
-            _, problem = exchange(self.main, {"check": data})
+            reply, problem = exchange(self.main, {"check": data})
             if problem is None:
+                self.take_plan(reply)
                 return
             log(f"ERROR: could not hand the check to the main server: {problem}; keeping it in the inbox.", error=True)
             self.down_since = utc_now()
@@ -1320,32 +1394,14 @@ class Standby(Watcher):
             except (OSError, ValueError):
                 data = None
             if data is not None:
-                _, problem = exchange(self.main, {"check": data})
+                reply, problem = exchange(self.main, {"check": data})
                 if problem:
                     log(f"ERROR: could not pass a check on to the main server: {problem}", error=True)
                     self.down_since = utc_now()
                     break  # do not discard checks or retry SSH on every loop iteration
-                else:
-                    log("Passed a check on to the main server.")
+                self.take_plan(reply)
+                log("Passed a check on to the main server.")
             remove(path)
-
-    def next_fill(self, now):
-        """When to check next in place of another computer (math.inf: not asked to)."""
-        if self.active or not self.fill:
-            return math.inf
-        return min(next_slot(now, self.fill_every, offset) for offset in self.fill)
-
-    def fill_in(self, backoff, due):
-        """Check in place of the computer the main server asked for and hand the check to it.
-        Apple's refusal pauses this like any other check (see Backoff)."""
-        missing = self.fill.get(int(due) % self.fill_every)
-        if missing is None or not backoff.allows(due):
-            return
-        result, error = backoff.look(self.parts)
-        log(f"For {source_name(missing)}: " + (summary(result, self.parts) if result else f"ERROR: {error}"))
-        _, problem = exchange(self.main, {"check": check_to_json(self.source, result, error)})
-        if problem:
-            log(f"ERROR: could not hand the check to the main server: {problem}", error=True)
 
     def sync(self):
         """Ask the main server how it is: keep its stock, stand in, or hand back."""
@@ -1359,10 +1415,8 @@ class Standby(Watcher):
             alive = parse_utc(reply.get("alive")) if reply else None
         if reply is not None and not self.dry_run:
             self.state["main_seen_utc"] = now.isoformat(timespec="seconds")
-        every = reply.get("every", 60) if reply else 60
-        self.fill_every = every if isinstance(every, int) and not isinstance(every, bool) and every >= 10 else 60
-        self.fill = fill_from_json(reply.get("fill"), self.fill_every) if alive and now - alive < MAIN_SILENT_AFTER else {}
         if alive and now - alive < MAIN_SILENT_AFTER:
+            self.take_plan(reply)
             self.down_since = None
             if self.active:  # the stock went with this call
                 self.active = False
@@ -1403,21 +1457,14 @@ class Standby(Watcher):
         self.status = Status(self.status.minutes)
         self.sell_outs = SellOuts()
         self.latest, self.acted = None, {}
+        # Who takes part from now on, as this server works it out: everyone the main server
+        # last named counts as heard, except the main server itself.
+        start = utc_now()
+        self.heard = {source: start for source in (self.main_plan or CYCLE_SLOTS) if source != "vps"}
+        self.refused, self.unreachable = {}, Counter()
         if not self.dry_run:
             tell(f"⚠️ VPS 1 не работает уже {minutes} мин ({why}). "
                  f"Проверку и отправку уведомлений продолжает {source_name(self.source)}.")
-
-
-def fill_from_json(items, every=60):
-    """The main server's request (see Watcher.fills) as {offset within its cycle: computer}."""
-    fill = {}
-    for item in items if isinstance(items, list) else []:
-        if isinstance(item, dict) and isinstance(item.get("offset"), int) and not isinstance(item["offset"], bool) and 0 <= item["offset"] < every:
-            try:
-                fill[item["offset"]] = text(item.get("source"), 20)
-            except ValueError:
-                continue
-    return fill
 
 
 def run_slots(parts, every, offset, dry_run, status_minutes=0, inbox=None, source="vps", standby_of=None,
@@ -1425,8 +1472,10 @@ def run_slots(parts, every, offset, dry_run, status_minutes=0, inbox=None, sourc
     """Check at fixed times on the clock, `offset` seconds past every multiple of `every`
     seconds (60 and 0: at :00 of every minute), and in between handle the checks other
     computers hand in through `inbox`. With `standby_of` (an ssh host) this
-    is a standby for that main server (see Standby). This computer's own request to Apple
-    does not hold up the checks handed in meanwhile (see OwnCheck). Runs until stopped."""
+    is a standby for that main server (see Standby). Checking at its own place of the full
+    cycle (CYCLE_SLOTS), it closes up with the others when one of them is out (see
+    CHECK_SPACING). This computer's own request to Apple does not hold up the checks handed
+    in meanwhile (see OwnCheck). Runs until stopped."""
     if standby_of:
         watcher = Standby(parts, dry_run, status_minutes, source, standby_of, participate, inbox, every, offset)
         sync_due = next_slot(time.time(), 60, SYNC_OFFSET)
@@ -1434,8 +1483,12 @@ def run_slots(parts, every, offset, dry_run, status_minutes=0, inbox=None, sourc
         watcher = Watcher(parts, dry_run, status_minutes, source, shared=inbox, offset=offset, every=every)
         sync_due = math.inf
     backoff = Backoff()
-    due = next_slot(time.time(), every, offset)
-    fill_due = math.inf
+    watcher.backoff = backoff
+    home = (every, offset)
+    shared = shares_cycle(source, every, offset)
+    plan, present_logged = home, None
+    due = next_slot(time.time(), *plan)
+    last_request = -math.inf  # this computer's last own request to Apple
     asking = None  # this computer's own check until Apple answers it
     while True:
         if inbox:
@@ -1445,30 +1498,32 @@ def run_slots(parts, every, offset, dry_run, status_minutes=0, inbox=None, sourc
             asking = None
             watcher.handle(source, (result.checked_at if result else None) or utc_now(), result, error)
         now = time.time()
+        if shared:
+            present = watcher.following(utc_now())
+            if present is not None and present != present_logged:
+                log(describe_plan(present, source))
+                present_logged = present
+            wanted = place(present, source) or home
+            if wanted != plan:
+                plan = wanted
+                due = next_slot(now, *plan)
+                if due - last_request < MIN_OWN_GAP:
+                    due = next_slot(due, *plan)
         if now >= sync_due:
-            synced_slot = sync_due
             watcher.sync()
-            if int(synced_slot) % watcher.fill_every in watcher.fill and asking is None:
-                # VPS 3's :45 slot coincides with the standby's status sync. Do not
-                # reschedule it to the next minute before making the requested fill.
-                watcher.fill_in(backoff, synced_slot)
             sync_due = next_slot(time.time(), 60, SYNC_OFFSET)
-            fill_due = watcher.next_fill(time.time())
-        elif now >= fill_due:
-            if asking is None:  # one request to Apple at a time
-                watcher.fill_in(backoff, fill_due)
-            fill_due = watcher.next_fill(time.time())
         elif now >= due:
             if asking is not None:
                 log("Apple has not answered the last check from here yet; not asking again in this slot.")
                 watcher.beat()
             elif watcher.checking() and backoff.allows(due):
+                last_request = time.time()
                 asking = OwnCheck(backoff, parts)
             else:
                 watcher.beat()
-            due = next_slot(time.time(), every, offset)
+            due = next_slot(time.time(), *plan)
         else:
-            wait = min(due, sync_due, fill_due) - now
+            wait = min(due, sync_due) - now
             time.sleep(min(wait, INBOX_POLL_SECONDS) if inbox or asking is not None else wait)
 
 
@@ -1595,7 +1650,9 @@ def ingest(inbox, source, stream):
     """--ingest (the server's SSH command for GitHub): save the checks sent on `stream`, one
     JSON line each (see check_to_json), into `inbox` for --watch --inbox, as coming from
     `source` whatever they say. Returns 1 with the reason on stderr if a check is not taken,
-    e.g. because the watcher has stopped reading the inbox, so that the sender notices."""
+    e.g. because the watcher has stopped reading the inbox, so that the sender notices.
+    Answers on stdout with who takes part in the checking (see CHECK_SPACING), as the watcher
+    here last said in STATUS_SYNC, or with {} if it has not said so lately."""
     inbox = Path(inbox)
     try:
         for line in iter(lambda: stream.readline(MAX_CHECK_BYTES + 1), b""):
@@ -1612,6 +1669,11 @@ def ingest(inbox, source, stream):
     except (OSError, ValueError) as exc:
         print(f"ERROR: check not taken: {exc}", file=sys.stderr, flush=True)
         return 1
+    status = read_shared(inbox / STATUS_SYNC)
+    alive = parse_utc(status.get("alive"))
+    present = plan_from_json(status.get("present"))
+    fresh = alive is not None and present is not None and abs(utc_now() - alive) < MAIN_SILENT_AFTER
+    print(json.dumps({"present": present} if fresh else {}), flush=True)
     return 0
 
 
@@ -1647,8 +1709,16 @@ def over_ssh(host, data):
 
 
 def deliver(feed, data):
-    """Hand one check to the server, where `ssh feed` runs --ingest. Returns None or the problem."""
-    return over_ssh(feed, json.dumps(data, ensure_ascii=False).encode("utf-8") + b"\n")[1]
+    """Hand one check to the server, where `ssh feed` runs --ingest. Returns (its answer, a
+    dict, or None; the problem or None)."""
+    out, problem = over_ssh(feed, json.dumps(data, ensure_ascii=False).encode("utf-8") + b"\n")
+    if problem:
+        return None, problem
+    try:
+        answer = json.loads(out.decode("utf-8").strip().splitlines()[-1]) if out and out.strip() else {}
+    except (ValueError, UnicodeDecodeError):
+        answer = {}
+    return (answer if isinstance(answer, dict) else {}), None
 
 
 def exchange(main, payload):
@@ -1705,32 +1775,48 @@ def run_probe(parts, feed, every, offset, minutes=0, source="github", backup=Non
     server's checks) and hand every answer to the server with deliver(); the server decides
     what to send. A check the server does not take goes to the standby server (`backup`).
     Stops after `minutes` (0: never). Tells Telegram once if neither has taken the checks for
-    PROBLEM_ALERT_AFTER, and once when they are taken again."""
+    PROBLEM_ALERT_AFTER, and once when they are taken again. Checking at its own place of the
+    full cycle (CYCLE_SLOTS), it closes up with the others as the server's answers say (see
+    CHECK_SPACING)."""
     end = time.time() + minutes * 60 if minutes else None
     backoff = Backoff()
     failing_since, notified = None, False
     name = source_name(source)
+    home = (every, offset)
+    shared = shares_cycle(source, every, offset)
+    plan, plan_at, logged = None, None, None  # who takes part, as the server last said, and when
+    last_request = -math.inf
     while True:
-        due = next_slot(time.time(), every, offset)
+        present = plan if plan is not None and time.time() - plan_at < PLAN_TTL.total_seconds() else None
+        mine = (place(present, source) if shared else None) or home
+        if shared and present is not None and present != logged:
+            log(describe_plan(present, source))
+            logged = present
+        due = next_slot(time.time(), *mine)
+        if due - last_request < MIN_OWN_GAP:  # the cycle changed just after this computer's check
+            due = next_slot(due, *mine)
         if end is not None and due >= end:
             return 0
         time.sleep(max(0.0, due - time.time()))
         if not backoff.allows(due):
             continue
+        last_request = time.time()
         result, error = backoff.look(parts)
         if result:
             log(summary(result, parts))
         else:
             log(f"ERROR: {error}", error=True)
         data = check_to_json(source, result, error)
-        problem = deliver(feed, data)
+        answer, problem = deliver(feed, data)
         if problem and backup:
-            spare = deliver(backup, data)
+            answer, spare = deliver(backup, data)
             if spare is None:
                 log(f"The server did not take the check ({problem}); the standby did.")
                 problem = None
             else:
                 problem = f"{problem}; standby: {spare}"
+        if answer and plan_from_json(answer.get("present")) is not None:
+            plan, plan_at = plan_from_json(answer["present"]), time.time()
         if problem is None:
             failing_since = None
             if notified and tell(f"✅ {name} снова передаёт проверки на сервер."):

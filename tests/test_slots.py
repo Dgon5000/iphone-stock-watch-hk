@@ -4,6 +4,7 @@ Apple, Telegram, ssh and the clock are fakes; nothing leaves the machine.
 """
 import io
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -463,7 +464,7 @@ class Probe(ProbeBase):
         def run(outcome):
             with mock.patch.object(self.cs.subprocess, "run", side_effect=outcome if isinstance(outcome, BaseException) else None,
                                    return_value=outcome):
-                return self.cs.deliver("feed", {"x": 1})
+                return self.cs.deliver("feed", {"x": 1})[1]
 
         self.assertEqual(run(subprocess.TimeoutExpired("ssh", 45)), "the server did not answer within 45 s")
         self.assertIn("could not run ssh", run(FileNotFoundError("ssh")))
@@ -516,7 +517,7 @@ class MainServer(SharedBase):
         self.run_until(hkt("10:02:10"))
         status = json.loads((self.inbox / "status.sync").read_text())
         self.assertEqual(status, {"alive": "2026-10-03T02:02:00+00:00", "checked": "2026-10-03T02:02:00+00:00",
-                                  "available": SILVER, "fill": [], "every": 60})
+                                  "available": SILVER, "present": ["github", "vps"]})
         self.assertEqual((self.inbox / "status.sync").stat().st_mode & 0o777, 0o644)  # the --sync user reads it
 
     def test_back_after_a_break_it_waits_two_minutes_then_reports(self):
@@ -569,62 +570,6 @@ class MainServer(SharedBase):
         self.assertIn("🖤 2TB · Black", alert)
         self.assertNotIn("512GB", alert)
         self.assertIn("🕐 Проверено: 03.10.2026 10:02 (HKT)", alert)  # GitHub's 10:02:30, after the quiet
-
-
-class MainFills(SharedBase):
-    """The main server asks the standby to check in place of a computer that cannot reach
-    Apple, or of a silent GitHub — never of one Apple refused."""
-
-    def fills_at(self, *times):
-        seen = {}
-
-        def look(now):
-            if now in times:
-                seen[now] = json.loads((self.inbox / "status.sync").read_text())["fill"]
-
-        self.clock.hooks.append(look)
-        return seen
-
-    def test_two_checks_without_reaching_apple_ask_the_standby_until_one_works(self):
-        down = URLError("timed out")
-        self.world.apple_errors = [down] * 4  # 10:01 and 10:02, each with its retry
-        seen = self.fills_at(hkt("10:01:20"), hkt("10:02:20"), hkt("10:03:20"))
-        self.run_until(hkt("10:03:30"))
-        self.assertEqual(seen, {hkt("10:01:20"): [], hkt("10:02:20"): [{"source": "vps", "offset": 0}], hkt("10:03:20"): []})
-
-    def test_apples_refusals_never_ask_the_standby(self):
-        self.world.apple_errors = [HTTPError("u", 541, "", {}, io.BytesIO(b"")) for _ in range(5)]
-        seen = self.fills_at(*(hkt(f"10:{m:02d}:20") for m in range(1, 12)))
-        self.run_until(hkt("10:12:00"))
-        self.assertEqual(set(json.dumps(f) for f in seen.values()), {"[]"})
-
-    def test_a_silent_github_is_filled_in_unless_apple_had_refused_it(self):
-        self.github = lambda moment: set() if moment <= hkt("10:02:30") else None
-        seen = self.fills_at(hkt("10:04:20"), hkt("10:05:20"))
-        self.run_until(hkt("10:05:30"))
-        self.assertEqual(seen, {hkt("10:04:20"): [], hkt("10:05:20"): [{"source": "github", "offset": 30}]})
-
-    def test_github_silent_after_a_refusal_or_for_a_moment_is_not_filled_in(self):
-        refused = "Apple returned HTTP 541; not treating this as out of stock."
-        self.github = lambda moment: (set() if moment < hkt("10:02:00") else RuntimeError(refused) if moment < hkt("10:03:00")
-                                      else None if moment < hkt("10:09:00") else set() if moment < hkt("10:10:00")
-                                      else None if moment < hkt("10:11:30") else set())
-        seen = self.fills_at(*(hkt(f"10:{m:02d}:20") for m in range(1, 13)))
-        self.run_until(hkt("10:12:30"))  # silent 10:03–10:08 after a refusal; a gap of 90 s at 10:10–10:11
-        self.assertEqual(set(json.dumps(f) for f in seen.values()), {"[]"})
-
-    def test_the_standbys_checks_count_and_its_silence_is_no_alarm(self):
-        def standby(now):
-            if now == hkt("10:01:16"):  # in place of a computer that could not check at 10:01:15
-                data = self.cs.check_to_json("backup", self.result(set(), utc("10:01:15")))
-                self.assertEqual(self.cs.sync(self.inbox, io.BytesIO(json.dumps({"check": data}).encode()), io.StringIO()), 0)
-
-        self.clock.hooks.append(standby)
-        self.run_until(hkt("10:45:10"), status_minutes=10)
-        texts = self.texts()
-        self.assertTrue(texts[0].endswith("🔁 Проверок за 10 мин: 20\n• VPS 1 — 9\n• VPS 2 — 1\n• GitHub — 10"), texts[0])
-        self.assertFalse([t for t in texts if t.startswith("⚠️")])  # a standby is meant to be quiet
-        self.assertIn("VPS 2: 6 stores × 12 models checked", sys.stdout.getvalue())
 
 
 class SyncCommand(FakeClockBase):
@@ -701,7 +646,7 @@ class StandbyBase(FakeClockBase):
         self.main_down = False
         self.main_alive = None  # None: now
         self.main_age = None  # None: from main_alive
-        self.main_fill = lambda now: []  # what the main server asks the standby to check for
+        self.main_present = None  # who takes part, as the main server says (None: it does not say)
         self.main_stock = SILVER
         self.calls = []  # (time, what the standby sent)
         self.apple = lambda moment: {("R499", U)}
@@ -717,7 +662,9 @@ class StandbyBase(FakeClockBase):
             return subprocess.CompletedProcess(args, 255, b"", b"ssh: connect to host 198.51.100.7 port 22: Connection timed out\n")
         alive = self.main_alive or datetime.fromtimestamp(self.clock.now, timezone.utc).isoformat()
         age = self.main_age if self.main_age is not None else int(self.clock.now - datetime.fromisoformat(alive).timestamp())
-        reply = {"alive": alive, "available": self.main_stock, "age": age, "fill": self.main_fill(self.clock.now)}
+        reply = {"alive": alive, "available": self.main_stock, "age": age}
+        if self.main_present is not None:
+            reply["present"] = self.main_present
         return subprocess.CompletedProcess(args, 0, json.dumps(reply).encode(), b"")
 
     def github_check(self, stock, when):
@@ -810,62 +757,6 @@ class StandbyFirstContact(StandbyBase):
         self.run_until(hkt("10:05:10"))
         self.assertTrue(self.texts()[0].startswith("⚠️ VPS 1 не работает уже 3 мин (нет связи)."))
         self.assertEqual(self.world.request_times, [hkt("10:04:00"), hkt("10:05:00")])
-
-
-class StandbyFillIn(StandbyBase):
-    def test_sync_does_not_skip_a_fill_at_the_same_second(self):
-        self.main_fill = lambda now: [{'source': 'third', 'offset': 45}]
-        self.run_until(hkt('10:03:10'))
-        self.assertEqual(self.world.request_times, [hkt(f'10:0{m}:45') for m in range(3)])
-        self.assertIn('For VPS 3:', sys.stdout.getvalue())
-
-    def test_fill_checks_follow_the_main_servers_45_second_cycle(self):
-        old_ssh = self.cs.subprocess.run
-
-        def ssh(*args, **kwargs):
-            done = old_ssh(*args, **kwargs)
-            reply = json.loads(done.stdout)
-            reply['every'] = 45
-            done.stdout = json.dumps(reply).encode()
-            return done
-
-        self.main_fill = lambda now: [{"source": "github", "offset": 0}]
-        standby = self.cs.Standby(list(PRO_MAX), False, 10, 'secondary', 'main', True, self.inbox, 45, 15)
-        with mock.patch.object(self.cs.subprocess, 'run', ssh):
-            standby.sync()
-            due = standby.next_fill(self.clock.now)
-            self.assertEqual(due, hkt('10:00:45'))
-            self.clock.now = due
-            standby.fill_in(self.cs.Backoff(), due)
-            self.assertEqual(standby.next_fill(due), hkt('10:01:30'))
-        self.assertEqual(self.calls[-1][1]['check']['source'], 'secondary')
-        self.assertEqual(self.cs.fill_from_json([{'source': 'github', 'offset': 15},
-                                               {'source': 'vps', 'offset': 45},
-                                               {'source': 'vps', 'offset': True}], 45), {15: 'github'})
-
-    def test_checks_in_place_of_the_computer_the_main_server_asks_for(self):
-        self.main_fill = lambda now: [{"source": "vps", "offset": 0}] if hkt("10:01:45") <= now < hkt("10:04:45") else []
-        self.run_until(hkt("10:07:10"))
-        self.assertEqual(self.world.request_times, [hkt("10:02:00"), hkt("10:03:00"), hkt("10:04:00")])
-        checks = [(t, p["check"]) for t, p in self.calls if "check" in p]
-        self.assertEqual([t for t, _ in checks], self.world.request_times)
-        self.assertEqual({c["source"] for _, c in checks}, {"backup"})
-        self.assertEqual(self.world.sent(), [])  # the main server decides what to send
-        self.assertIn("For VPS 1: 6 stores × 12 models checked", sys.stdout.getvalue())
-
-    def test_its_own_refusal_pauses_filling_in(self):
-        self.main_fill = lambda now: [{"source": "github", "offset": 30}]
-        self.world.apple_errors = [HTTPError("u", 541, "", {}, io.BytesIO(b""))]
-        self.run_until(hkt("10:05:40"))
-        self.assertEqual(self.world.request_times, [hkt("10:01:30"), hkt("10:03:30"), hkt("10:04:30"), hkt("10:05:30")])
-
-    def test_keeps_checks_while_the_main_server_is_out_of_reach(self):
-        (self.tmp / "stock_state.json").write_text(json.dumps({"main_seen_utc": "2026-10-03T01:00:00+00:00"}))
-        self.main_down = True
-        self.run_until(hkt("10:01:40"), lambda now: self.github_check({("R499", U)}, "10:01:30") if now == hkt("10:01:31") else None)
-        self.assertEqual([p for _, p in self.calls], [{}])  # just the sync at 10:00:45
-        [saved] = self.inbox.glob("*.json")
-        self.assertEqual(json.loads(saved.read_text())["source"], "github")
 
 
 class ProbeWithStandby(ProbeBase):
@@ -1016,7 +907,7 @@ class FourComputerCycle(SharedBase):
         self.assertEqual([(c["time"][11:19], c["source"]) for c in checks], expected)
         times = [datetime.fromisoformat(c["time"]).timestamp() for c in checks]
         self.assertEqual([b - a for a, b in zip(times, times[1:])], [15] * 19)
-        self.assertEqual(json.loads((self.inbox / 'status.sync').read_text())['every'], 60)
+        self.assertEqual(json.loads((self.inbox / 'status.sync').read_text())['present'], ['github', 'secondary', 'vps', 'third'])
         texts = self.texts()
         self.assertEqual(len(texts), 2)
         self.assertIn("🟢 Появились", texts[0])
@@ -1026,14 +917,14 @@ class FourComputerCycle(SharedBase):
         self.assertIn('• <b>VPS 3</b> — 5', footer)
 
     def test_github_probe_uses_the_first_slot(self):
-        with mock.patch.object(self.cs, "deliver", return_value=None):
+        with mock.patch.object(self.cs, "deliver", return_value=({}, None)):
             self.assertEqual(self.cs.run_probe(list(PRO_MAX), "feed", 60, 0, minutes=3), 0)
         self.assertEqual(self.world.request_times, [hkt('10:00:00') + i * 60 for i in range(3)])
 
     def test_vps3_uses_the_last_slot_and_its_own_backoff(self):
         self.world.apple_errors = [HTTPError('u', 541, '', {}, io.BytesIO(b''))]
         delivered = []
-        with mock.patch.object(self.cs, 'deliver', side_effect=lambda host, data: delivered.append((host, data))):
+        with mock.patch.object(self.cs, 'deliver', side_effect=lambda host, data: (delivered.append((host, data)), ({}, None))[1]):
             self.assertEqual(self.cs.run_probe(list(PRO_MAX), 'feed', 60, 45, minutes=4, source='third', backup='feed2'), 0)
         self.assertEqual(self.world.request_times, [hkt('10:00:45'), hkt('10:02:45'), hkt('10:03:45')])
         self.assertTrue(all(data['source'] == 'third' for _, data in delivered))
@@ -1067,13 +958,13 @@ class SixComputerCycle(FourComputerCycle):
         self.assertEqual(len(self.texts()), 2)
         self.assertIn('🟢 Появились', self.texts()[0])
         self.assertIn('🔴 Закончились', self.texts()[1])
-        self.assertEqual(json.loads((self.inbox / 'status.sync').read_text())['every'], 90)
+        self.assertEqual(json.loads((self.inbox / 'status.sync').read_text())['present'], list(self.cs.CYCLE_SLOTS))
         self.assertEqual(set(self.state()['sources']), set(order))
         footer = self.cs.check_counts_footer(5, {source: 3 for source in order})
         self.assertIn('• <b>VPS 4</b> — 3\n• <b>VPS 5</b> — 3', footer)
 
     def test_github_probe_uses_the_first_slot(self):
-        with mock.patch.object(self.cs, 'deliver', return_value=None):
+        with mock.patch.object(self.cs, 'deliver', return_value=({}, None)):
             self.cs.run_probe(list(PRO_MAX), 'feed', 90, 0, minutes=5)
         self.assertEqual(self.world.request_times, [hkt('10:00:00') + i * 90 for i in range(4)])
 
@@ -1083,7 +974,7 @@ class SixComputerCycle(FourComputerCycle):
             before = len(self.world.request_times)
             self.world.apple_errors = [HTTPError('u', 541, '', {}, io.BytesIO(b''))]
             delivered = []
-            with mock.patch.object(self.cs, 'deliver', side_effect=lambda host, data: delivered.append(data)):
+            with mock.patch.object(self.cs, 'deliver', side_effect=lambda host, data: (delivered.append(data), ({}, None))[1]):
                 self.cs.run_probe(list(PRO_MAX), 'feed', 90, offset, minutes=6, source=source, backup='feed2')
             self.assertEqual(self.world.request_times[before:], [hkt('10:00:00') + offset + i for i in (0, 180, 270)])
             self.assertTrue(all(data['source'] == source for data in delivered))
@@ -1209,16 +1100,168 @@ class SixComputerCycle(FourComputerCycle):
         with mock.patch.object(self.cs, 'fetch_stock', side_effect=Stop()), self.assertRaises(Stop):
             self.cs.run_slots(list(PRO_MAX), 90, 30, False, 0, self.inbox, 'vps')
 
-    def test_delayed_checks_do_not_shift_the_silent_probe_slots(self):
-        watcher = self.cs.Watcher(list(PRO_MAX), False, 10, 'vps', every=90, offset=30)
-        for source, offset in (('github', 0), ('third', 45), ('fourth', 60), ('fifth', 75)):
-            stamp = datetime.fromtimestamp(hkt('10:00:00') + offset + 2, timezone.utc)
-            watcher.note(source, stamp, self.result(set(), stamp), None)
-        wanted = watcher.fills(utc('10:06:00'))
-        self.assertEqual({item['source']: item['offset'] for item in wanted},
-                         {'github': 0, 'third': 45, 'fourth': 60, 'fifth': 75})
-        watcher.note('fourth', utc('10:06:00'), None, RuntimeError('Apple returned HTTP 541'))
-        self.assertNotIn('fourth', {item['source'] for item in watcher.fills(utc('10:10:00'))})
+
+
+class SharedCycle(SixComputerCycle):
+    """When a computer is out — silent, refused by Apple, or unable to reach it — the others
+    close up at once: a check every 15 s while five take part, and never more often than every
+    75 s from one computer."""
+
+    FIVE = ['github', 'secondary', 'vps', 'third', 'fifth']  # VPS 4 out
+
+    def test_the_cycle_is_spread_over_the_computers_taking_part(self):
+        place, everyone = self.cs.place, list(self.cs.CYCLE_SLOTS)
+        self.assertEqual({s: place(everyone, s) for s in everyone}, {s: (90, o) for s, o in self.cs.CYCLE_SLOTS.items()})
+        self.assertEqual([place(self.FIVE, s) for s in self.FIVE], [(75, 0), (75, 15), (75, 30), (75, 45), (75, 60)])
+        self.assertIsNone(place(self.FIVE, 'fourth'))
+        four = ['github', 'secondary', 'vps', 'third']
+        self.assertEqual([place(four, s) for s in four], [(75, 0), (75, 18.75), (75, 37.5), (75, 56.25)])
+        self.assertEqual(place(['vps'], 'vps'), (75, 0))
+        self.assertIsNone(place(None, 'vps'))
+        self.assertTrue(self.cs.shares_cycle('third', 90, 45))
+        self.assertFalse(self.cs.shares_cycle('third', 60, 45))
+        self.assertFalse(self.cs.shares_cycle('vps', 90, 0))
+        self.assertFalse(self.cs.shares_cycle('mac', 90, 0))
+        self.assertEqual(self.cs.plan_from_json(['github', 'mac', 'vps']), ['github', 'vps'])
+        self.assertIsNone(self.cs.plan_from_json('vps'))
+
+    def test_who_is_out_and_who_is_back(self):
+        self.clock.now = hkt('10:00:00')
+        watcher = self.cs.Watcher(list(PRO_MAX), False, 0, 'vps', shared=self.inbox, every=90, offset=30)
+        everyone = list(self.cs.CYCLE_SLOTS)
+        self.assertEqual(watcher.present(utc('10:00:00')), everyone)  # all count as heard at the start
+
+        def check(source, at, error=None):
+            self.clock.now = hkt(at)
+            watcher.note(source, utc(at), None if error else self.result(set(), utc(at)), error)
+
+        for source in everyone:
+            if source != 'fourth':
+                check(source, '10:01:30')
+        self.assertEqual(watcher.present(utc('10:01:44')), everyone)
+        self.assertEqual(watcher.present(utc('10:01:46')), self.FIVE)  # nothing from VPS 4 for over 105 s
+        check('fifth', '10:01:50', 'Apple returned HTTP 541; not treating this as out of stock.')
+        self.assertNotIn('fifth', watcher.present(utc('10:01:50')))  # refused: out at once, while it pauses
+        check('third', '10:01:51', 'Could not reach Apple: timed out; not treating this as out of stock.')
+        self.assertIn('third', watcher.present(utc('10:01:51')))
+        check('third', '10:01:52', 'Could not reach Apple: timed out; not treating this as out of stock.')
+        self.assertNotIn('third', watcher.present(utc('10:01:52')))  # twice in a row
+        check('github', '10:01:53', 'Apple returned HTTP 503; not treating this as out of stock.')
+        self.assertIn('github', watcher.present(utc('10:01:53')))  # Apple's other errors do not pause it
+        for source in ('third', 'fourth', 'fifth'):
+            check(source, '10:02:00')
+        self.assertEqual(watcher.present(utc('10:02:00')), everyone)  # each back with its next good check
+        watcher.backoff = self.cs.Backoff()
+        watcher.backoff.until = self.clock.now + 120  # Apple made this server pause
+        self.assertNotIn('vps', watcher.present(utc('10:02:00')))
+
+    def test_the_main_server_closes_up_when_a_computer_goes_silent(self):
+        # VPS 4 checks at 10:01:00 and then no more: from 10:02:46 the five close up.
+        self.clock.hooks.append(lambda now: self.next_checks.__setitem__('fourth', math.inf) if now >= hkt('10:01:02') else None)
+        self.clock.hooks.append(lambda now: (_ for _ in ()).throw(Stop()) if now >= hkt('10:07:00') else None)
+        with self.assertRaises(Stop):
+            self.cs.run_slots(list(PRO_MAX), 90, 30, False, 0, self.inbox, 'vps')
+        first = self.cs.next_slot(hkt('10:02:46'), 75, 30)
+        expected = [hkt('10:00:30'), hkt('10:02:00')] + [first + 75 * i for i in range(5) if first + 75 * i < hkt('10:07:00')]
+        self.assertEqual(self.world.request_times, expected)
+        self.assertEqual(json.loads((self.inbox / 'status.sync').read_text())['present'], self.FIVE)
+        self.assertIn('Taking part: GitHub, VPS 2, VPS 1, VPS 3, VPS 5 (VPS 4 out); a check every 15 s, '
+                      'from here every 75 s, 30 s into the cycle.', sys.stdout.getvalue())
+
+    def test_a_probe_closes_up_as_the_server_answers_and_never_checks_twice_in_30_s(self):
+        answers = [{'present': self.FIVE}]
+
+        def run(args, input=None, capture_output=None, timeout=None):
+            answer = answers[0] if answers else {}
+            return subprocess.CompletedProcess(args, 0, (json.dumps(answer) + '\n').encode(), b'')
+
+        with mock.patch.object(self.cs.subprocess, 'run', run):
+            self.cs.run_probe(list(PRO_MAX), 'feed', 90, 75, minutes=8, source='fifth')
+        times = self.world.request_times
+        self.assertEqual(times[0], hkt('10:01:15'))  # its own place until the server answers
+        self.assertEqual(times[1], self.cs.next_slot(times[0] + 30, 75, 60))  # then 60 s into a 75-s cycle
+        self.assertEqual({b - a for a, b in zip(times[1:], times[2:])}, {75})
+        self.assertIn('Taking part: GitHub, VPS 2, VPS 1, VPS 3, VPS 5 (VPS 4 out); a check every 15 s, '
+                      'from here every 75 s, 60 s into the cycle.', sys.stdout.getvalue())
+
+    def test_after_a_change_of_the_cycle_a_probe_waits_30_s_since_its_last_request(self):
+        # Three take part: VPS 3's new place comes 5 s after its check at 10:00:45; it skips it.
+        answer = {'present': ['secondary', 'vps', 'third']}
+        run = lambda args, input=None, capture_output=None, timeout=None: subprocess.CompletedProcess(
+            args, 0, json.dumps(answer).encode(), b'')
+        with mock.patch.object(self.cs.subprocess, 'run', run):
+            self.cs.run_probe(list(PRO_MAX), 'feed', 90, 45, minutes=4, source='third')
+        first, second = self.world.request_times[:2]
+        self.assertEqual(first, hkt('10:00:45'))
+        too_soon = self.cs.next_slot(first, 75, 50)
+        self.assertLess(too_soon - first, 30)
+        self.assertEqual(second, self.cs.next_slot(too_soon, 75, 50))
+
+    def test_a_probe_left_out_or_without_an_answer_keeps_its_own_place(self):
+        for answer in ({}, {'present': ['github', 'secondary', 'vps', 'third', 'fourth']}, {'present': 'bad'}):
+            with self.subTest(answer=answer):
+                self.clock.now = hkt('09:59:59')
+                before = len(self.world.request_times)
+                run = lambda args, input=None, capture_output=None, timeout=None: subprocess.CompletedProcess(
+                    args, 0, json.dumps(answer).encode(), b'')
+                with mock.patch.object(self.cs.subprocess, 'run', run):
+                    self.cs.run_probe(list(PRO_MAX), 'feed', 90, 75, minutes=5, source='fifth')
+                self.assertEqual(self.world.request_times[before:], [hkt('10:01:15') + 90 * i for i in range(3)])
+
+    def test_ingest_answers_with_who_takes_part_while_the_watcher_says_so(self):
+        def answer(status):
+            if status is not None:
+                (self.inbox / 'status.sync').write_text(json.dumps(status))
+            out = io.StringIO()
+            data = self.cs.check_to_json('fifth', self.result(set(), utc('10:00:00')))
+            with mock.patch('sys.stdout', out):
+                self.assertEqual(self.cs.ingest(self.inbox, 'fifth', io.BytesIO(json.dumps(data).encode() + b'\n')), 0)
+            return json.loads(out.getvalue())
+
+        self.assertEqual(answer(None), {})
+        fresh = datetime.fromtimestamp(self.clock.now, timezone.utc).isoformat()
+        self.assertEqual(answer({'alive': fresh, 'present': self.FIVE}), {'present': self.FIVE})
+        stale = datetime.fromtimestamp(self.clock.now - 600, timezone.utc).isoformat()
+        self.assertEqual(answer({'alive': stale, 'present': self.FIVE}), {})
+
+
+class StandbyInTheCycle(StandbyBase):
+    FIVE = SharedCycle.FIVE
+
+    def test_the_standby_closes_up_as_the_main_server_says(self):
+        self.main_present = self.FIVE
+
+        def stop(now):
+            if now >= hkt('10:06:00'):
+                raise Stop()
+
+        self.clock.hooks[:] = [stop]
+        with self.assertRaises(Stop):
+            self.cs.run_slots(list(PRO_MAX), 90, 15, False, 10, self.inbox, 'secondary', 'main', True)
+        times = self.world.request_times
+        self.assertEqual(times[0], hkt('10:00:15'))  # its own place, 15 s into the cycle
+        # The main server's answer to that check names five: 15 s into a 75-s cycle from then
+        # on, but not within 30 s of the last request.
+        due = self.cs.next_slot(times[0], 75, 15)
+        self.assertEqual(times[1], due if due - times[0] >= 30 else self.cs.next_slot(due, 75, 15))
+        self.assertEqual({b - a for a, b in zip(times[1:], times[2:])}, {75})
+        self.assertTrue(all(c['source'] == 'secondary' for _, p in self.calls if 'check' in p for c in [p['check']]))
+
+    def test_standing_in_it_works_out_who_takes_part_and_says_so(self):
+        (self.tmp / 'stock_state.json').write_text(json.dumps({'main_seen_utc': '2026-10-03T01:00:00+00:00'}))
+        self.main_down = True
+
+        def stop(now):
+            if now >= hkt('10:05:10'):
+                raise Stop()
+
+        self.clock.hooks[:] = [stop]
+        with self.assertRaises(Stop):
+            self.cs.run_slots(list(PRO_MAX), 90, 15, False, 10, self.inbox, 'secondary', 'main', True)
+        status = json.loads((self.inbox / 'status.sync').read_text())
+        self.assertNotIn('vps', status['present'])
+        self.assertIn('secondary', status['present'])
+        self.assertTrue(self.texts()[0].startswith('⚠️ VPS 1 не работает уже 3 мин'))
 
 
 class Installer(unittest.TestCase):
