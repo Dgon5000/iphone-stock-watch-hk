@@ -237,14 +237,14 @@ class Shared(SharedBase):
         problems = []
         self.clock.hooks.append(lambda now: problems.append("problem" in self.state()) if now == hkt("10:30:05") else None)
         self.run_until(hkt("10:46:10"))
-        self.assertEqual(problems, [False])  # right after the server's failed 10:30 check: GitHub works, so no outage
+        self.assertEqual(problems, [False])  # the server keeps failing, but GitHub works, so no outage
         self.assertEqual(self.world.request_times,
-                         [hkt(t) for t in ("10:01:00", "10:03:00", "10:07:00", "10:15:00", "10:30:00", "10:45:00")])
+                         [hkt(t) for t in ("10:01:00", "10:05:00", "10:13:00", "10:28:00", "10:43:00")])
         texts = self.texts()
         self.assertEqual(len(texts), 1)  # GitHub kept watching, so no "nothing works" alert
         self.assertTrue(texts[0].startswith("⚠️ VPS 1: проверки не работают уже 30 мин. Наличие продолжает проверять GitHub."), texts[0])
         self.assertIn("Последняя ошибка: Apple returned HTTP 429", texts[0])
-        self.assertIn("no checks from here for 2 min", self.stderr())
+        self.assertIn("no checks from here for 4 min", self.stderr())
         self.assertIn("no checks from here for 15 min", self.stderr())
 
     def test_when_both_fail_there_is_one_overall_alert(self):
@@ -363,7 +363,7 @@ class RefusalProtection(FakeClockBase):
         self.assertFalse(restarted.allows(self.clock.now))
         self.clock.now = restarted.until
         restarted.look(list(PRO_MAX))
-        self.assertEqual(restarted.until - self.clock.now, 240)
+        self.assertEqual(restarted.until - self.clock.now, 480)
         self.clock.now = restarted.until
         restarted.look(list(PRO_MAX))
         self.assertFalse(self.cs.BACKOFF_FILE.exists())
@@ -381,14 +381,15 @@ class RefusalProtection(FakeClockBase):
         with mock.patch.object(self.cs, 'write_shared', side_effect=OSError('disk failure')):
             _, error = backoff.look(list(PRO_MAX))
         self.assertEqual(error.code, 541)
-        self.assertFalse(backoff.allows(self.clock.now + 119))
+        self.assertFalse(backoff.allows(self.clock.now + 239))
 
     def test_repeated_refusals_increase_the_pause_cap_it_and_reset_after_success(self):
+        # No retry after 2 minutes: Apple went on refusing an address for well over 10.
         for code in (403, 429, 541):
             with self.subTest(code=code):
                 backoff = self.cs.Backoff()
                 self.world.apple_errors = [HTTPError('u', code, '', {}, io.BytesIO(b'')) for _ in range(5)]
-                for pause in (120, 240, 480, 900, 900):
+                for pause in (240, 480, 900, 900, 900):
                     result, error = backoff.look(list(PRO_MAX))
                     self.assertIsNone(result)
                     self.assertEqual(error.code, code)
@@ -448,17 +449,18 @@ class Probe(ProbeBase):
 
     def test_apple_refusal_pauses_the_probe_and_the_error_is_handed_in(self):
         self.world.apple_errors = [HTTPError("u", 403, "Forbidden", {}, io.BytesIO(b""))]
-        self.probe(minutes=4)
-        self.assertEqual(self.world.request_times, [hkt("10:00:30"), hkt("10:02:30"), hkt("10:03:30")])
+        self.probe(minutes=6)
+        self.assertEqual(self.world.request_times, [hkt("10:00:30"), hkt("10:04:30"), hkt("10:05:30")])
         self.assertTrue(self.delivered[0][1]["error"].startswith("Apple returned HTTP 403"))
         self.assertIn("stores", self.delivered[1][1])
 
     def test_apples_541_is_a_refusal_too(self):
         # 541: what Apple answered the server when it asked once a minute for an hour
         self.world.apple_errors = [HTTPError("u", 541, "", {}, io.BytesIO(b""))] * 2
-        self.probe(minutes=8)
-        self.assertEqual(self.world.request_times, [hkt(t) for t in ("10:00:30", "10:02:30", "10:06:30", "10:07:30")])
+        self.probe(minutes=14)
+        self.assertEqual(self.world.request_times, [hkt(t) for t in ("10:00:30", "10:04:30", "10:12:30", "10:13:30")])
         self.assertIn("Apple refused the request (HTTP 541); no checks from here for 4 min.", self.stderr())
+        self.assertIn("Apple refused the request (HTTP 541); no checks from here for 8 min.", self.stderr())
 
     def test_delivery_problems_are_explained(self):
         def run(outcome):
@@ -855,8 +857,8 @@ class ParticipatingStandby(StandbyBase):
 
     def test_refusal_pauses_the_secondary_without_extra_requests(self):
         self.world.apple_errors = [HTTPError("u", 541, "", {}, io.BytesIO(b""))]
-        self.run_until(hkt("10:03:40"))
-        self.assertEqual(self.world.request_times, [hkt("10:00:20"), hkt("10:02:20"), hkt("10:03:20")])
+        self.run_until(hkt("10:05:40"))
+        self.assertEqual(self.world.request_times, [hkt("10:00:20"), hkt("10:04:20"), hkt("10:05:20")])
         self.assertIn("HTTP 541", self.accepted[0]["error"])
         self.assertEqual(self.world.sent(), [])
 
@@ -925,8 +927,8 @@ class FourComputerCycle(SharedBase):
         self.world.apple_errors = [HTTPError('u', 541, '', {}, io.BytesIO(b''))]
         delivered = []
         with mock.patch.object(self.cs, 'deliver', side_effect=lambda host, data: (delivered.append((host, data)), ({}, None))[1]):
-            self.assertEqual(self.cs.run_probe(list(PRO_MAX), 'feed', 60, 45, minutes=4, source='third', backup='feed2'), 0)
-        self.assertEqual(self.world.request_times, [hkt('10:00:45'), hkt('10:02:45'), hkt('10:03:45')])
+            self.assertEqual(self.cs.run_probe(list(PRO_MAX), 'feed', 60, 45, minutes=6, source='third', backup='feed2'), 0)
+        self.assertEqual(self.world.request_times, [hkt('10:00:45'), hkt('10:04:45'), hkt('10:05:45')])
         self.assertTrue(all(data['source'] == 'third' for _, data in delivered))
         self.assertIn('HTTP 541', delivered[0][1]['error'])
 
@@ -976,7 +978,7 @@ class SixComputerCycle(FourComputerCycle):
             delivered = []
             with mock.patch.object(self.cs, 'deliver', side_effect=lambda host, data: (delivered.append(data), ({}, None))[1]):
                 self.cs.run_probe(list(PRO_MAX), 'feed', 90, offset, minutes=6, source=source, backup='feed2')
-            self.assertEqual(self.world.request_times[before:], [hkt('10:00:00') + offset + i for i in (0, 180, 270)])
+            self.assertEqual(self.world.request_times[before:], [hkt('10:00:00') + offset + i for i in (0, 270)])  # 4 min pause
             self.assertTrue(all(data['source'] == source for data in delivered))
             self.assertIn('HTTP 541', delivered[0]['error'])
 

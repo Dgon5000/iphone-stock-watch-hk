@@ -94,8 +94,9 @@ INBOX_POLL_SECONDS = 0.2
 TELEGRAM_SEND_TIMEOUT = 10
 STATUS_SEND_WAIT = 3
 # When Apple refuses requests (HTTP 403, 429, or 541 — Apple's own "too many requests from
-# this address"), the computer pauses its checks for 2, 4, 8 and then at most 15 minutes
-# instead of insisting.
+# this address"), the computer pauses its checks for 4, 8 and then at most 15 minutes
+# instead of insisting. (Apple goes on refusing an address for well over 10 minutes: a retry
+# after 2 minutes was refused nearly every time.)
 REFUSED_CODES = (403, 429, 541)
 MAX_REFUSED_PAUSE_SECONDS = 15 * 60
 # Checks handed in by another computer (--probe → --ingest → --watch --inbox): at most this
@@ -985,7 +986,7 @@ def describe_plan(present, source):
 
 
 class Backoff:
-    """When Apple refuses, pause for 2, 4, 8, then 15 minutes, including across restarts."""
+    """When Apple refuses, pause for 4, 8, then 15 minutes, including across restarts."""
 
     def __init__(self):
         self.refusals, self.until = 0, 0.0
@@ -1006,7 +1007,7 @@ class Backoff:
         except Exception as exc:
             if getattr(exc, "code", None) in REFUSED_CODES:
                 self.refusals += 1
-                pause = min(60 * 2 ** self.refusals, MAX_REFUSED_PAUSE_SECONDS)
+                pause = min(60 * 2 ** (self.refusals + 1), MAX_REFUSED_PAUSE_SECONDS)
                 self.until = time.time() + pause
                 try:
                     write_shared(BACKOFF_FILE, {"refusals": min(self.refusals, 4), "until": self.until}, mode=0o600)
