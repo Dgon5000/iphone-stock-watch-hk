@@ -1137,8 +1137,9 @@ class SharedCycle(SixComputerCycle):
     def test_a_change_of_the_cycle_never_makes_anyone_look_silent(self):
         # From the 75-s cycle back to the 90-s one, a computer's next check can come up to a full
         # cycle plus MIN_OWN_GAP after its last; with a slow delivery that still counts as heard.
-        longest = 90 + self.cs.MIN_OWN_GAP + 5
-        self.assertLess(longest, self.cs.OUT_AFTER.total_seconds())
+        full = self.cs.CHECK_SPACING * len(self.cs.CYCLE_SLOTS)
+        longest = full + self.cs.MIN_OWN_GAP + 5
+        self.assertLess(longest, self.cs.out_after().total_seconds())
 
     def test_who_is_out_and_who_is_back(self):
         self.clock.now = hkt('10:00:00')
@@ -1176,7 +1177,7 @@ class SharedCycle(SixComputerCycle):
         self.clock.hooks.append(lambda now: (_ for _ in ()).throw(Stop()) if now >= hkt('10:07:00') else None)
         with self.assertRaises(Stop):
             self.cs.run_slots(list(PRO_MAX), 90, 30, False, 0, self.inbox, 'vps')
-        first = self.cs.next_slot(hkt('10:01:01') + self.cs.OUT_AFTER.total_seconds(), 75, 30)
+        first = self.cs.next_slot(hkt('10:01:01') + self.cs.out_after().total_seconds(), 75, 30)
         expected = [hkt('10:00:30'), hkt('10:02:00')] + [first + 75 * i for i in range(5) if first + 75 * i < hkt('10:07:00')]
         self.assertEqual(self.world.request_times, expected)
         self.assertEqual(json.loads((self.inbox / 'status.sync').read_text())['present'], self.FIVE)
@@ -1251,6 +1252,8 @@ class NineComputerCycle(Base):
         self.assertFalse(self.cs.shares_cycle('fifth', 90, 75))  # the six-computer setting is not the cycle any more
         eight = [s for s in order if s != 'seventh']
         self.assertEqual(self.cs.place(eight, 'eighth'), (120, 105))
+        # A full cycle of 135 s plus the wait after a change: nobody looks silent before 180 s.
+        self.assertEqual(self.cs.out_after().total_seconds(), 180)
         footer = self.cs.check_counts_footer(10, {s: 1 for s in order})
         self.assertTrue(footer.endswith('• <b>VPS 5</b> — 1\n• <b>VPS 6</b> — 1\n• <b>VPS 7</b> — 1\n'
                                         '• <b>VPS 8</b> — 1\n• <b>GitHub</b> — 1'), footer)
@@ -1288,6 +1291,16 @@ class StandbyInTheCycle(StandbyBase):
         self.assertEqual(times[1], due if due - times[0] >= 30 else self.cs.next_slot(due, 75, 15))
         self.assertEqual({b - a for a, b in zip(times[1:], times[2:])}, {75})
         self.assertTrue(all(c['source'] == 'secondary' for _, p in self.calls if 'check' in p for c in [p['check']]))
+
+    def test_the_standby_takes_the_cycle_only_with_the_answer_to_its_own_check(self):
+        # Taken in from the minute's sync, a change could put off its next check by most of
+        # two cycles; with the answer to its own check it comes within a cycle plus 30 s.
+        self.main_present = self.FIVE
+        standby = self.cs.Standby(list(PRO_MAX), False, 10, 'secondary', 'main', True, self.inbox, 90, 15)
+        standby.sync()
+        self.assertIsNone(standby.following(self.cs.utc_now()))
+        standby.handle('secondary', self.cs.utc_now(), self.result(set(), self.cs.utc_now()))
+        self.assertEqual(standby.following(self.cs.utc_now()), self.FIVE)
 
     def test_standing_in_it_works_out_who_takes_part_and_says_so(self):
         (self.tmp / 'stock_state.json').write_text(json.dumps({'main_seen_utc': '2026-10-03T01:00:00+00:00'}))

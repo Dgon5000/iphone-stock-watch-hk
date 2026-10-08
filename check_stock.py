@@ -127,17 +127,18 @@ MAX_SYNC_BYTES = 16 * 1024 * 1024
 # every max(n × CHECK_SPACING, MIN_EVERY) seconds at its own evenly spaced place (see place),
 # so Apple is asked every CHECK_SPACING seconds while five or six take part, and never more
 # often than every MIN_EVERY seconds from one computer, lest Apple refuse the others in turn.
-# A computer that is out — nothing heard from it for OUT_AFTER, Apple refused its last check
+# A computer that is out — nothing heard from it for out_after(), Apple refused its last check
 # (it pauses, see Backoff) or it could not reach Apple UNREACHABLE_AFTER times in a row — is
 # left out at once and the others close up; its next good check takes it back. The main
 # server works out who takes part (Watcher.present) and says so in STATUS_SYNC and in every
-# answer to --ingest and --sync; a computer that has heard nothing for PLAN_TTL goes back to
-# its own place. When the cycle changes, a computer still waits MIN_OWN_GAP seconds after its
-# last request, so its checks may then come up to a full cycle (90 s) plus MIN_OWN_GAP apart:
-# OUT_AFTER leaves room for that and for a slow delivery.
+# answer to --ingest and --sync; every computer takes it in only with the answer to its own
+# check, and one that has heard nothing for PLAN_TTL goes back to its own place. When the
+# cycle changes, a computer still waits MIN_OWN_GAP seconds after its last request, so its
+# checks may then come up to a full cycle plus MIN_OWN_GAP apart: out_after() leaves room for
+# that and for a slow delivery (OUT_SLACK).
 CHECK_SPACING = 15
 MIN_EVERY = 75
-OUT_AFTER = timedelta(seconds=135)
+OUT_SLACK = 15
 UNREACHABLE_AFTER = 2
 PLAN_TTL = timedelta(minutes=5)
 MIN_OWN_GAP = 30
@@ -970,6 +971,12 @@ def shares_cycle(source, every, offset):
     return CYCLE_SLOTS.get(source) == offset and every == CHECK_SPACING * len(CYCLE_SLOTS)
 
 
+def out_after():
+    """How long a computer may stay silent before it is left out of the cycle (see
+    CHECK_SPACING): the longest gap a change of the cycle allows, plus a slow delivery."""
+    return timedelta(seconds=CHECK_SPACING * len(CYCLE_SLOTS) + MIN_OWN_GAP + OUT_SLACK)
+
+
 def plan_from_json(value):
     """The computers taking part, as the main server named them (see CHECK_SPACING), or None."""
     if isinstance(value, list) and all(isinstance(source, str) for source in value):
@@ -1231,7 +1238,7 @@ class Watcher:
                 out = self.backoff is not None and not self.backoff.allows(time.time())
             else:
                 heard = self.heard.get(source)
-                out = heard is None or now - heard > OUT_AFTER or self.refused.get(source)
+                out = heard is None or now - heard > out_after() or self.refused.get(source)
             if not out and self.unreachable[source] < UNREACHABLE_AFTER:
                 taking.append(source)
         return taking
@@ -1404,7 +1411,6 @@ class Standby(Watcher):
                     log(f"ERROR: could not pass a check on to the main server: {problem}", error=True)
                     self.down_since = utc_now()
                     break  # do not discard checks or retry SSH on every loop iteration
-                self.take_plan(reply)
                 log("Passed a check on to the main server.")
             remove(path)
 
@@ -1421,7 +1427,6 @@ class Standby(Watcher):
         if reply is not None and not self.dry_run:
             self.state["main_seen_utc"] = now.isoformat(timespec="seconds")
         if alive and now - alive < MAIN_SILENT_AFTER:
-            self.take_plan(reply)
             self.down_since = None
             if self.active:  # the stock went with this call
                 self.active = False
