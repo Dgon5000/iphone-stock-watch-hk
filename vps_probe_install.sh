@@ -1,5 +1,5 @@
 #!/bin/bash
-# Install VPS 3, 4 or 5 as a checking-only service. It sends results to VPS 1 or VPS 2;
+# Install VPS 3 to VPS 8 as a checking-only service. It sends results to VPS 1 or VPS 2;
 # it never takes over Telegram polling or stock alerts.
 # Supply MAIN_HOST and BACKUP_HOST (the addresses of VPS 1 and VPS 2, kept out of this public
 # repository) and verified MAIN_HOST_KEY and BACKUP_HOST_KEY (ssh-ed25519 public host keys).
@@ -9,13 +9,16 @@ APP="${APP:-/opt/iphone-stock-watch-hk}"
 UNIT_DIR="${UNIT_DIR:-/etc/systemd/system}"
 MAIN_HOST="${MAIN_HOST:-}"
 BACKUP_HOST="${BACKUP_HOST:-}"
-EVERY="${EVERY:-90}"
+EVERY="${EVERY:-135}"
 SOURCE="${SOURCE:-third}"
 case "$SOURCE" in
   third) PROBE_NAME="VPS 3"; DEFAULT_OFFSET=45 ;;
   fourth) PROBE_NAME="VPS 4"; DEFAULT_OFFSET=60 ;;
   fifth) PROBE_NAME="VPS 5"; DEFAULT_OFFSET=75 ;;
-  *) echo "SOURCE — third, fourth или fifth." >&2; exit 1 ;;
+  sixth) PROBE_NAME="VPS 6"; DEFAULT_OFFSET=90 ;;
+  seventh) PROBE_NAME="VPS 7"; DEFAULT_OFFSET=105 ;;
+  eighth) PROBE_NAME="VPS 8"; DEFAULT_OFFSET=120 ;;
+  *) echo "SOURCE — third, fourth, fifth, sixth, seventh или eighth." >&2; exit 1 ;;
 esac
 OFFSET="${OFFSET:-$DEFAULT_OFFSET}"
 NAME=iphone-stock-watch-hk

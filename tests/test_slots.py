@@ -622,10 +622,11 @@ class SyncCommand(FakeClockBase):
         self.assertEqual(json.loads(saved.read_text()), data)
 
     def test_passes_new_probe_checks_from_the_standby_to_the_main(self):
-        for source in ('fourth', 'fifth'):
+        probes = ('fourth', 'fifth', 'sixth', 'seventh', 'eighth')
+        for source in probes:
             data = self.cs.check_to_json(source, self.result({('R409', U)}, utc('10:01:00')))
             self.assertEqual(self.sync(json.dumps({'check': data}).encode())[0], 0)
-        self.assertEqual({json.loads(p.read_text())['source'] for p in self.shared.glob('*.json')}, {'fourth', 'fifth'})
+        self.assertEqual({json.loads(p.read_text())['source'] for p in self.shared.glob('*.json')}, set(probes))
 
     def test_refuses_what_is_not_right(self):
         with mock.patch.object(self.cs, "MAX_SYNC_BYTES", 200):
@@ -936,6 +937,12 @@ class FourComputerCycle(SharedBase):
 class SixComputerCycle(FourComputerCycle):
     def setUp(self):
         super().setUp()
+        # The cycle logic does not depend on the number of computers: these tests keep the
+        # six-computer cycle (90 s), which lines up with their times from 10:00:00.
+        six = {'github': 0, 'secondary': 15, 'vps': 30, 'third': 45, 'fourth': 60, 'fifth': 75}
+        patch = mock.patch.dict(self.cs.CYCLE_SLOTS, six, clear=True)
+        patch.start()
+        self.patches.append(patch)
         self.next_checks = {source: hkt('10:00:00') + offset
                             for source, offset in self.cs.CYCLE_SLOTS.items() if source != 'vps'}
 
@@ -1233,8 +1240,35 @@ class SharedCycle(SixComputerCycle):
         self.assertEqual(answer({'alive': stale, 'present': self.FIVE}), {})
 
 
+class NineComputerCycle(Base):
+    """The cycle in use since 8 October: GitHub, VPS 2, VPS 1 and VPS 3 to VPS 8, 15 s apart."""
+
+    def test_nine_places_135_s_and_the_names_and_order_in_the_status(self):
+        order = ['github', 'secondary', 'vps', 'third', 'fourth', 'fifth', 'sixth', 'seventh', 'eighth']
+        self.assertEqual(list(self.cs.CYCLE_SLOTS), order)
+        self.assertEqual([self.cs.place(order, s) for s in order], [(135, 15 * i) for i in range(9)])
+        self.assertTrue(all(self.cs.shares_cycle(s, 135, 15 * i) for i, s in enumerate(order)))
+        self.assertFalse(self.cs.shares_cycle('fifth', 90, 75))  # the six-computer setting is not the cycle any more
+        eight = [s for s in order if s != 'seventh']
+        self.assertEqual(self.cs.place(eight, 'eighth'), (120, 105))
+        footer = self.cs.check_counts_footer(10, {s: 1 for s in order})
+        self.assertTrue(footer.endswith('• <b>VPS 5</b> — 1\n• <b>VPS 6</b> — 1\n• <b>VPS 7</b> — 1\n'
+                                        '• <b>VPS 8</b> — 1\n• <b>GitHub</b> — 1'), footer)
+        line = '[2026-10-08 10:00:00 HKT] VPS 8: 6 stores × 12 models checked — no pickup stock'
+        self.assertEqual(len(list(__import__('stock_report').import_journal([line]))), 1)
+
+
 class StandbyInTheCycle(StandbyBase):
     FIVE = SharedCycle.FIVE
+
+    def setUp(self):
+        super().setUp()
+        # The cycle logic does not depend on the number of computers: these tests keep the
+        # six-computer cycle (90 s), which lines up with their times from 10:00:00.
+        six = {'github': 0, 'secondary': 15, 'vps': 30, 'third': 45, 'fourth': 60, 'fifth': 75}
+        patch = mock.patch.dict(self.cs.CYCLE_SLOTS, six, clear=True)
+        patch.start()
+        self.patches.append(patch)
 
     def test_the_standby_closes_up_as_the_main_server_says(self):
         self.main_present = self.FIVE
@@ -1325,7 +1359,7 @@ class Installer(unittest.TestCase):
         done = self.install("feed-key", self.KEY)
         self.assertEqual(done.returncode, 0, done.stderr)
         unit = (self.units / "iphone-stock-watch-hk.service").read_text()
-        self.assertIn(f"check_stock.py --watch --every 90 --offset 30 --status-minutes 10 --inbox {self.inbox}\n", unit)
+        self.assertIn(f"check_stock.py --watch --every 135 --offset 30 --status-minutes 10 --inbox {self.inbox}\n", unit)
         self.assertIn(f"ReadWritePaths={self.app} {self.inbox}\n", unit)
         self.assertEqual(self.keys(), f'restrict,command="{self.python} -I {self.lib}/check_stock.py --ingest {self.inbox} '
                                       f'--source github" {self.KEY}\n')
@@ -1379,7 +1413,7 @@ class Installer(unittest.TestCase):
         done = self.install("standby", "198.51.100.7", MAIN_HOST_KEY=self.MAIN_KEY)
         self.assertEqual(done.returncode, 0, done.stderr)
         unit = (self.units / "iphone-stock-watch-hk.service").read_text()
-        self.assertIn(f"--every 90 --offset 15 --status-minutes 10 --inbox {self.inbox} --source secondary --standby-of main --participate\n", unit)
+        self.assertIn(f"--every 135 --offset 15 --status-minutes 10 --inbox {self.inbox} --source secondary --standby-of main --participate\n", unit)
         self.assertFalse((self.units / "iphone-stock-watch-hk-bot.service").exists())  # the bot stays on the main server
         self.assertEqual((self.lib / "role").read_text(), "standby 198.51.100.7\n")
         ssh = self.app / ".ssh"
@@ -1461,7 +1495,7 @@ class Installer(unittest.TestCase):
     def test_each_new_probe_key_forces_its_source_and_keeps_existing_keys(self):
         self.assertEqual(self.install('feed-key', self.KEY).returncode, 0)
         self.assertEqual(self.install('probe-key', self.KEY.replace('github-feed', 'vps3-feed')).returncode, 0)
-        for source in ('fourth', 'fifth'):
+        for source in ('fourth', 'fifth', 'sixth', 'seventh', 'eighth'):
             key = self.KEY.replace('github-feed', source + '-feed')
             done = self.install('probe-key', key, source)
             self.assertEqual(done.returncode, 0, done.stderr)
@@ -1470,9 +1504,10 @@ class Installer(unittest.TestCase):
             data = json.dumps({'source': 'github', 'time': '2026-10-03T10:01:00+08:00', 'error': 'HTTP 541'}) + '\n'
             done = subprocess.run(command, input=data, capture_output=True, text=True, env=self.env, timeout=30)
             self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertEqual({json.loads(p.read_text())['source'] for p in self.inbox.glob('*.json')}, {'fourth', 'fifth'})
+        self.assertEqual({json.loads(p.read_text())['source'] for p in self.inbox.glob('*.json')},
+                         {'fourth', 'fifth', 'sixth', 'seventh', 'eighth'})
         keys = self.keys()
-        self.assertEqual(len(keys.splitlines()), 4)
+        self.assertEqual(len(keys.splitlines()), 7)
         self.assertEqual(self.install().returncode, 0)
         self.assertEqual(self.keys(), keys)
         self.assertEqual(self.install('probe-key', self.KEY, 'github').returncode, 1)
@@ -1502,7 +1537,7 @@ class Installer(unittest.TestCase):
         done = self.probe_install(PART_NUMBERS=U)
         self.assertEqual(done.returncode, 0, done.stderr)
         unit = (self.units / 'iphone-stock-watch-hk.service').read_text()
-        self.assertIn('--probe feed --backup feed2 --every 90 --offset 45 --source third', unit)
+        self.assertIn('--probe feed --backup feed2 --every 135 --offset 45 --source third', unit)
         self.assertIn('Restart=always', unit)
         self.assertFalse((self.units / 'iphone-stock-watch-hk-bot.service').exists())
         self.assertEqual((self.app / 'config.env').read_text(), f'PART_NUMBERS={U}\n')
@@ -1526,7 +1561,7 @@ class Installer(unittest.TestCase):
         done = self.probe_install(SOURCE='fourth')
         self.assertEqual(done.returncode, 0, done.stderr)
         unit = self.units / 'iphone-stock-watch-hk.service'
-        self.assertIn('--every 90 --offset 60 --source fourth', unit.read_text())
+        self.assertIn('--every 135 --offset 60 --source fourth', unit.read_text())
         before = unit.read_bytes()
         self.assertEqual(self.probe_install(SOURCE='fifth').returncode, 1)
         self.assertEqual(unit.read_bytes(), before)
@@ -1536,11 +1571,21 @@ class Installer(unittest.TestCase):
         (self.app / 'config.env').unlink()
         done = self.probe_install(SOURCE='fifth')
         self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertIn('--every 90 --offset 75 --source fifth', (self.units / 'iphone-stock-watch-hk.service').read_text())
+        self.assertIn('--every 135 --offset 75 --source fifth', (self.units / 'iphone-stock-watch-hk.service').read_text())
         self.assertEqual(self.probe_install(SOURCE='fifth; true').returncode, 1)
 
+    def test_vps6_to_vps8_installers_take_the_last_places_of_the_cycle(self):
+        for source, name, offset in (('sixth', 'VPS 6', 90), ('seventh', 'VPS 7', 105), ('eighth', 'VPS 8', 120)):
+            with self.subTest(source=source):
+                (self.units / 'iphone-stock-watch-hk.service').unlink(missing_ok=True)
+                done = self.probe_install(SOURCE=source)
+                self.assertEqual(done.returncode, 0, done.stderr)
+                unit = (self.units / 'iphone-stock-watch-hk.service').read_text()
+                self.assertIn(f'--every 135 --offset {offset} --source {source}', unit)
+                self.assertIn(f'Description={name} Apple Store Hong Kong iPhone stock probe', unit)
+
     def test_bad_settings_and_commands_are_refused(self):
-        for env in ({"EVERY": "5"}, {"OFFSET": "90"}, {"STATUS_MINUTES": "x"}, {"EVERY": "1m"}):
+        for env in ({"EVERY": "5"}, {"OFFSET": "135"}, {"STATUS_MINUTES": "x"}, {"EVERY": "1m"}):
             with self.subTest(env=env):
                 self.assertEqual(self.install(**env).returncode, 1)
         done = self.install("frobnicate")

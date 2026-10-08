@@ -5,10 +5,10 @@ Checks in-store pickup availability of the watched iPhone part numbers at every
 Apple Store in Hong Kong and sends one Telegram alert when a configuration comes
 into stock at any of them.
 
-Six computers share a 90-second cycle: GitHub at offset 0 (--probe), a participating
-standby at offset 15 (--watch --standby-of HOST --participate), and the main server at
-offset 30 (--watch --every 90 --offset 30 --inbox DIR), then VPS 3, 4 and 5 at offsets
-45, 60 and 75 (--probe).
+Nine computers share a 135-second cycle (CYCLE_SLOTS): GitHub at offset 0 (--probe), a
+participating standby at offset 15 (--watch --standby-of HOST --participate), the main
+server at offset 30 (--watch --every 135 --offset 30 --inbox DIR), then VPS 3 to VPS 8 at
+offsets 45 to 120 (--probe); when one is out, the others close up (see CHECK_SPACING).
 All remote computers hand their
 answers to the main server over SSH. Only the main server sends stock alerts and keeps
 the combined history while it is healthy; the standby takes over during an outage.
@@ -108,8 +108,11 @@ INBOX_STALE_SECONDS = 300
 WORKING_WINDOW = timedelta(minutes=3)
 # One set of server names for check counts, errors, recovery notices and logs.
 SOURCE_NAMES = {"vps": "VPS 1", "github": "GitHub", "mac": "Mac", "backup": "VPS 2",
-                "secondary": "VPS 2", "third": "VPS 3", "fourth": "VPS 4", "fifth": "VPS 5"}
-CYCLE_SLOTS = {"github": 0, "secondary": 15, "vps": 30, "third": 45, "fourth": 60, "fifth": 75}
+                "secondary": "VPS 2", "third": "VPS 3", "fourth": "VPS 4", "fifth": "VPS 5",
+                "sixth": "VPS 6", "seventh": "VPS 7", "eighth": "VPS 8"}
+CYCLE_SLOTS = {"github": 0, "secondary": 15, "vps": 30, "third": 45, "fourth": 60, "fifth": 75,
+               "sixth": 90, "seventh": 105, "eighth": 120}
+COUNT_ORDER = ("vps", "secondary", "third", "fourth", "fifth", "sixth", "seventh", "eighth", "github")
 # A standby server (--standby-of) asks the main server how it is at this many seconds past
 # every minute (--sync), keeping a copy of its stock. It stands in once the main server has
 # not been working for MAIN_SILENT_AFTER; back after a break that long, the main server
@@ -817,7 +820,7 @@ def check_counts_footer(minutes, counts, sources=()):
         combined["secondary" if source == "backup" else source] += count
     wanted = {"secondary" if s == "backup" else s for s in sources if s}
     wanted.update(s for s in combined if s)
-    shown = [s for s in ("vps", "secondary", "third", "fourth", "fifth", "github") if s in wanted]
+    shown = [s for s in COUNT_ORDER if s in wanted]
     shown += sorted(wanted - set(shown))
     lines = [f"🔁 Проверок за {minutes} мин: {sum(combined.values())}"]
     for source in shown:
@@ -1756,7 +1759,7 @@ def sync(shared, stream, out):
             write_shared(shared / f"history-{time.time_ns()}.sync", history_from_json(data["history"]))
         if "check" in data:  # the standby's check in place of another computer, or GitHub's passed on
             check = data["check"]
-            if not isinstance(check, dict) or check.get("source") not in ("backup", "secondary", "third", "fourth", "fifth", "github"):
+            if not isinstance(check, dict) or check.get("source") not in ("backup", *(s for s in CYCLE_SLOTS if s != "vps")):
                 raise ValueError("bad check")
             check_from_json(check)
             save_check(shared, check)
@@ -2060,7 +2063,7 @@ def main():
         return run_bot(parts)
     if args.status:
         result = fetch_stock(parts)
-        footer = check_counts_footer(10, recent_check_counts(), ("vps", "secondary", "third", "fourth", "fifth", "github"))
+        footer = check_counts_footer(10, recent_check_counts(), COUNT_ORDER)
         send_telegram(status_message(result, parts, footer))
         log("Status sent to Telegram.")
         return 0
