@@ -66,6 +66,9 @@ TELEGRAM_TOKEN_RE = re.compile(r"[0-9]+:[A-Za-z0-9_-]+")  # bot number, colon, s
 TELEGRAM_MAX_LENGTH = 4000  # Telegram allows 4096 characters per message.
 # Report a broken watcher to Telegram only once it has been failing this long.
 PROBLEM_ALERT_AFTER = timedelta(minutes=30)
+# A computer that Apple refuses pauses (see Backoff) and is let in again after about half an
+# hour as a rule, while the others go on checking: Telegram hears of it only after this long.
+REFUSED_ALERT_AFTER = timedelta(hours=1)
 # While Apple releases stock its answers flicker ("in stock", nothing, "in stock"
 # seconds apart), so a sell-out is reported only if another check this much later agrees.
 CONFIRM_DELAY_SECONDS = 20
@@ -1087,8 +1090,9 @@ class SellOuts:
 
 class Sources:
     """The computers that check (this server, GitHub, …) and when each last had an answer
-    from Apple. Tells Telegram once when one has had none for PROBLEM_ALERT_AFTER while
-    another still works, and once when it is back; if none works, that is report_health's.
+    from Apple. Tells Telegram once when one has had none for PROBLEM_ALERT_AFTER (for
+    REFUSED_ALERT_AFTER if Apple refused its last check) while another still works, and once
+    when it is back; if none works, that is report_health's.
     `occasional` computers (a standby filling in) count as working but may fall silent."""
 
     def __init__(self, state, now, occasional=()):
@@ -1124,10 +1128,11 @@ class Sources:
                     down.remove(source)
                 continue
             silent = now - self.ok.get(source, self.since[source])
-            if source in down or not working or silent < PROBLEM_ALERT_AFTER:
+            error = self.errors.get(source)
+            limit = REFUSED_ALERT_AFTER if error and refused(error) else PROBLEM_ALERT_AFTER
+            if source in down or not working or silent < limit:
                 continue
             minutes = int(silent.total_seconds() // 60)
-            error = self.errors.get(source)
             text = f"⚠️ {name}: проверки {'не работают' if error else 'не приходят'} уже {minutes} мин. "
             names = list(dict.fromkeys(source_name(s) for s in working))
             text += f"Наличие продолжает проверять {', '.join(names)}."

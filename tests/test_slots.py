@@ -75,14 +75,15 @@ class FakeClockBase(Base):
 
 class SourceNotifications(FakeClockBase):
     def test_failures_and_recovery_use_the_same_names_as_check_counts(self):
-        labels = {"vps": "VPS 1", "secondary": "VPS 2", "third": "VPS 3", "fourth": "VPS 4", "fifth": "VPS 5", "github": "GitHub"}
+        labels = {"vps": "VPS 1", "secondary": "VPS 2", "third": "VPS 3", "fourth": "VPS 4", "fifth": "VPS 5",
+                  "sixth": "VPS 6", "seventh": "VPS 7", "eighth": "VPS 8", "github": "GitHub"}
         for failed, name in labels.items():
             with self.subTest(source=failed):
                 start = self.cs.utc_now()
                 later = start + timedelta(minutes=31)
                 sources = self.cs.Sources({"sources": list(labels)}, start)
                 sources.seen(failed, start)
-                sources.seen(failed, later, RuntimeError("Apple returned HTTP 541"))
+                sources.seen(failed, later, RuntimeError("Could not reach Apple: timed out"))
                 for source in labels:
                     if source != failed:
                         sources.seen(source, later)
@@ -94,10 +95,53 @@ class SourceNotifications(FakeClockBase):
                 working = ", ".join(label for source, label in labels.items() if source != failed)
                 self.assertEqual(self.texts()[before:], [
                     f"⚠️ {name}: проверки не работают уже 31 мин. Наличие продолжает проверять {working}."
-                    "\n\nПоследняя ошибка: Apple returned HTTP 541",
+                    "\n\nПоследняя ошибка: Could not reach Apple: timed out",
                     f"✅ {name}: проверки снова работают.",
                 ])
                 self.assertIn(f"<b>{name}</b>", self.cs.check_counts_footer(10, {failed: 1}))
+
+    def refusals(self, refused_at, back_at, until):
+        """VPS 8 checks fine at minute 0, Apple refuses it at the minutes refused_at (its pauses)
+        and lets it in at back_at, while VPS 1 checks fine every minute; a report each minute."""
+        start = self.cs.utc_now()
+        sources = self.cs.Sources({"sources": ["vps", "eighth"]}, start)
+        sources.seen("eighth", start)
+        for minute in range(1, until + 1):
+            now = start + timedelta(minutes=minute)
+            sources.seen("vps", now)
+            if minute in refused_at:
+                sources.seen("eighth", now, RuntimeError("Apple returned HTTP 541; not treating this as out of stock."))
+            elif minute == back_at:
+                sources.seen("eighth", now)
+            sources.report(now)
+        return self.texts()
+
+    def test_apples_usual_half_hour_refusal_is_not_reported(self):
+        # refused, again after 4 and 8 min of pause, let in after 15 more: 31 min without a check
+        self.assertEqual(self.refusals(refused_at={2, 7, 16}, back_at=31, until=40), [])
+
+    def test_a_refusal_lasting_over_an_hour_is_reported_once_and_so_is_the_return(self):
+        texts = self.refusals(refused_at={2, 7, 16, 32, 48}, back_at=64, until=70)
+        self.assertEqual(texts, [
+            "⚠️ VPS 8: проверки не работают уже 60 мин. Наличие продолжает проверять VPS 1."
+            "\n\nПоследняя ошибка: Apple returned HTTP 541; not treating this as out of stock.",
+            "✅ VPS 8: проверки снова работают.",
+        ])
+
+    def test_another_failure_after_a_refusal_is_reported_after_30_minutes(self):
+        start = self.cs.utc_now()
+        sources = self.cs.Sources({"sources": ["vps", "eighth"]}, start)
+        sources.seen("eighth", start)
+        sources.seen("eighth", start + timedelta(minutes=2), RuntimeError("Apple returned HTTP 429"))
+        sources.seen("vps", start + timedelta(minutes=31))
+        sources.report(start + timedelta(minutes=31))
+        self.assertEqual(self.texts(), [])
+        sources.seen("eighth", start + timedelta(minutes=32), RuntimeError("Could not reach Apple: timed out"))
+        sources.report(start + timedelta(minutes=32))
+        self.assertEqual(self.texts(), [
+            "⚠️ VPS 8: проверки не работают уже 32 мин. Наличие продолжает проверять VPS 1."
+            "\n\nПоследняя ошибка: Could not reach Apple: timed out",
+        ])
 
     def test_legacy_backup_and_secondary_are_one_named_server(self):
         start = self.cs.utc_now()
@@ -234,15 +278,17 @@ class Shared(SharedBase):
 
     def test_refusals_pause_the_server_while_github_goes_on(self):
         self.world.apple_errors = [HTTPError("u", 429, "Too Many Requests", {}, io.BytesIO(b"")) for _ in range(10)]
-        problems = []
+        problems, quiet = [], []
         self.clock.hooks.append(lambda now: problems.append("problem" in self.state()) if now == hkt("10:30:05") else None)
-        self.run_until(hkt("10:46:10"))
+        self.clock.hooks.append(lambda now: quiet.append(self.texts()) if now == hkt("11:01:05") else None)
+        self.run_until(hkt("11:02:10"))
         self.assertEqual(problems, [False])  # the server keeps failing, but GitHub works, so no outage
+        self.assertEqual(quiet, [[]])  # nor a word about the server within the hour of its pauses
         self.assertEqual(self.world.request_times,
-                         [hkt(t) for t in ("10:01:00", "10:05:00", "10:13:00", "10:28:00", "10:43:00")])
+                         [hkt(t) for t in ("10:01:00", "10:05:00", "10:13:00", "10:28:00", "10:43:00", "10:58:00")])
         texts = self.texts()
         self.assertEqual(len(texts), 1)  # GitHub kept watching, so no "nothing works" alert
-        self.assertTrue(texts[0].startswith("⚠️ VPS 1: проверки не работают уже 30 мин. Наличие продолжает проверять GitHub."), texts[0])
+        self.assertTrue(texts[0].startswith("⚠️ VPS 1: проверки не работают уже 60 мин. Наличие продолжает проверять GitHub."), texts[0])
         self.assertIn("Последняя ошибка: Apple returned HTTP 429", texts[0])
         self.assertIn("no checks from here for 4 min", self.stderr())
         self.assertIn("no checks from here for 15 min", self.stderr())
