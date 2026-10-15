@@ -14,11 +14,13 @@ answers to the main server over SSH. Only the main server sends stock alerts and
 the combined history while it is healthy; the standby takes over during an outage.
 """
 import argparse
+import http.client
 import itertools
 import json
 import math
 import os
 import re
+import socket
 import ssl
 import subprocess
 import sys
@@ -33,7 +35,7 @@ from html import escape
 from pathlib import Path
 from urllib.error import HTTPError
 from urllib.parse import urlencode
-from urllib.request import Request, urlopen
+from urllib.request import HTTPSHandler, Request, build_opener, urlopen
 
 # iPhone 18 Pro Max 512GB, 1TB and 2TB in every colour Apple Hong Kong sells.
 # Hong Kong part numbers end in ZA/A; UK ones (…QN/A) are not sold here.
@@ -96,6 +98,10 @@ INBOX_POLL_SECONDS = 0.2
 # background, so it never holds up the checks and the alerts.
 TELEGRAM_SEND_TIMEOUT = 10
 STATUS_SEND_WAIT = 3
+# Most of those hangs are the connection itself not being made (seen from VPS 1 about once a
+# day), so connecting is given up already after TELEGRAM_CONNECT_TIMEOUT: the fresh connection
+# then works at once. Nothing has been sent yet at that point, so no message can come twice.
+TELEGRAM_CONNECT_TIMEOUT = 3
 # When Apple refuses requests (HTTP 403, 429, or 541 — Apple's own "too many requests from
 # this address"), the computer pauses its checks for 4, 8 and then at most 15 minutes
 # instead of insisting. (Apple goes on refusing an address for well over 10 minutes: a retry
@@ -452,6 +458,32 @@ def fetch_stock(parts):
     return CheckResult(len(store_numbers), products, available, missing, answered_at)
 
 
+class QuickConnection(http.client.HTTPSConnection):
+    """An HTTPS connection that gives up connecting after TELEGRAM_CONNECT_TIMEOUT and then
+    waits for the answer as long as the request allows."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._create_connection = self.connect_quickly
+
+    @staticmethod
+    def connect_quickly(address, timeout, source_address=None):
+        wait = timeout if isinstance(timeout, (int, float)) else socket.getdefaulttimeout()
+        sock = socket.create_connection(address, min(wait or TELEGRAM_CONNECT_TIMEOUT, TELEGRAM_CONNECT_TIMEOUT), source_address)
+        sock.settimeout(wait)
+        return sock
+
+
+class QuickHTTPSHandler(HTTPSHandler):
+    def https_open(self, req):
+        return self.do_open(QuickConnection, req, context=self._context)
+
+
+def telegram_urlopen(request, timeout, context):
+    """urlopen for Telegram, through QuickConnection."""
+    return build_opener(QuickHTTPSHandler(context=context)).open(request, timeout=timeout)
+
+
 def telegram_api(token, method, payload=None, timeout=30, document=None):
     """Call a Telegram Bot API method and return its result. `document` is a
     (filename, bytes) file to upload, e.g. for sendDocument."""
@@ -474,7 +506,7 @@ def telegram_api(token, method, payload=None, timeout=30, document=None):
     request = Request(TELEGRAM_API.format(token=token, method=method), data=data, headers={"Content-Type": content_type})
     for attempt in (1, 2):
         try:
-            with urlopen(request, timeout=timeout, context=ssl_context()) as response:
+            with telegram_urlopen(request, timeout=timeout, context=ssl_context()) as response:
                 reply = json.loads(response.read().decode("utf-8"))
         except HTTPError as exc:
             try:

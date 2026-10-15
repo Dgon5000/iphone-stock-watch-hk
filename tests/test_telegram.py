@@ -8,6 +8,7 @@ import json
 import os
 import re
 import shutil
+import ssl
 import sys
 import tempfile
 import threading
@@ -238,12 +239,14 @@ class Base(unittest.TestCase):
         self.cs = check_stock
         self.world = FakeWorld()
         self.sleeps = []
+        self.real_telegram_urlopen = self.cs.telegram_urlopen
         self.patches = [
             mock.patch.dict(os.environ, {
                 "TELEGRAM_BOT_TOKEN": "123456:SECRET-token", "TELEGRAM_CHAT_ID": "987654321",
                 "PART_NUMBERS": "", "GITHUB_SERVER_URL": "", "GITHUB_REPOSITORY": "", "GITHUB_RUN_ID": "",
             }),
             mock.patch.object(self.cs, "urlopen", self.world.urlopen),
+            mock.patch.object(self.cs, "telegram_urlopen", self.world.urlopen),
             mock.patch.object(self.cs, "CONFIG_FILE", self.tmp / "home-config" / "config.env"),
             mock.patch("builtins.input", side_effect=AssertionError("unexpected input() call")),
             mock.patch.object(self.cs.time, "sleep", self.sleeps.append),
@@ -683,7 +686,7 @@ class AlertScenarios(Base):
         import http.client
         def boom(req, timeout=None, context=None):
             raise http.client.InvalidURL(f"URL can't contain control characters. {req.full_url!r}")
-        with mock.patch.object(self.cs, "urlopen", boom):
+        with mock.patch.object(self.cs, "telegram_urlopen", boom):
             with self.assertRaises(RuntimeError) as ctx:
                 self.cs.telegram_api("123:SECRET-token", "getMe")
         self.assertEqual(str(ctx.exception), "Telegram getMe request failed: InvalidURL")
@@ -895,11 +898,50 @@ class TelegramDelivery(Base):
             timeouts.append(timeout)
             return self.world.urlopen(req, timeout, context)
 
-        with mock.patch.object(self.cs, "urlopen", urlopen):
+        with mock.patch.object(self.cs, "telegram_urlopen", urlopen):
             self.cs.send_telegram("🟢 Появились")
         self.assertEqual(timeouts, [10, 10])
         self.assertEqual(len(self.world.sent()), 1)
         self.assertIn("Telegram did not answer (The handshake operation timed out); trying again.", sys.stdout.getvalue())
+
+    def test_connecting_is_given_up_after_3_s_but_the_answer_is_awaited_as_long_as_asked(self):
+        calls = []
+
+        class Sock:
+            def settimeout(self, value):
+                calls.append(("answer", value))
+
+            def setsockopt(self, *args):
+                pass
+
+        class Context:  # what HTTPSConnection needs of an SSLContext, without the handshake
+            verify_mode, check_hostname, post_handshake_auth = ssl.CERT_REQUIRED, True, None
+
+            def wrap_socket(self, sock, server_hostname=None):
+                return sock
+
+        def create_connection(address, timeout, source_address=None):
+            calls.append(("connect", address, timeout))
+            return Sock()
+
+        with mock.patch.object(self.cs.socket, "create_connection", create_connection):
+            self.cs.QuickConnection("api.telegram.org", timeout=10, context=Context()).connect()
+        self.assertEqual(calls, [("connect", ("api.telegram.org", 443), 3), ("answer", 10)])
+
+    def test_a_connection_that_is_not_made_is_tried_afresh_each_time_for_3_s(self):
+        timeouts = []
+
+        def create_connection(address, timeout, source_address=None):
+            timeouts.append(timeout)
+            raise TimeoutError("timed out")
+
+        with mock.patch.object(self.cs, "telegram_urlopen", self.real_telegram_urlopen), \
+                mock.patch.object(self.cs.socket, "create_connection", create_connection):
+            with self.assertRaisesRegex(RuntimeError, "^Could not reach Telegram: timed out$") as caught:
+                self.cs.send_telegram("🟢 Появились")
+        self.assertEqual(timeouts, [3, 3])
+        self.assertNotIn("SECRET", str(caught.exception))
+        self.assertIn("Telegram did not answer (timed out); trying again.", sys.stdout.getvalue())
 
     def test_a_second_failed_connection_is_an_error_without_the_token(self):
         self.world.telegram = lambda url, data: (_ for _ in ()).throw(URLError(ConnectionResetError(104, "Connection reset by peer")))
