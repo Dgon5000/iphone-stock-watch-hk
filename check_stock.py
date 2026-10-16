@@ -37,10 +37,12 @@ from urllib.error import HTTPError
 from urllib.parse import urlencode
 from urllib.request import HTTPSHandler, Request, build_opener, urlopen
 
-# iPhone 18 Pro Max 512GB, 1TB and 2TB in every colour Apple Hong Kong sells.
+# iPhone 18 Pro Max 512GB, 1TB and 2TB and iPhone Duo in every size, each in every colour
+# Apple Hong Kong sells: 20 part numbers, as many as one request to Apple takes.
 # Hong Kong part numbers end in ZA/A; UK ones (…QN/A) are not sold here.
 # Override with the PART_NUMBERS environment variable (comma separated).
 DEFAULT_PART_NUMBERS = [
+    # iPhone 18 Pro Max
     "MJXU4ZA/A",  # 512GB Silver
     "MJXT4ZA/A",  # 512GB Black
     "MJXW4ZA/A",  # 512GB Glacier
@@ -53,6 +55,15 @@ DEFAULT_PART_NUMBERS = [
     "MJY24ZA/A",  # 2TB Black
     "MJY54ZA/A",  # 2TB Glacier
     "MJY44ZA/A",  # 2TB Burgundy
+    # iPhone Duo, on pre-order from 16 October 2026, 20:00 HKT
+    "MK2D4ZA/A",  # 256GB Star White
+    "MK2E4ZA/A",  # 256GB Night Sky
+    "MK2F4ZA/A",  # 512GB Star White
+    "MK2G4ZA/A",  # 512GB Night Sky
+    "MK2H4ZA/A",  # 1TB Star White
+    "MK2J4ZA/A",  # 1TB Night Sky
+    "MK2K4ZA/A",  # 2TB Star White
+    "MK2L4ZA/A",  # 2TB Night Sky
 ]
 
 # Hong Kong has no postcodes. Apple accepts a district name and returns all six
@@ -174,6 +185,7 @@ COLOR_EMOJI = {
     "silver": "🩶", "black": "🖤", "glacier": "🩵", "burgundy": "❤️",
     "white": "🤍", "gold": "💛", "blue": "💙", "teal": "🩵", "pink": "🩷",
     "green": "💚", "sage": "💚", "lavender": "💜", "purple": "💜", "orange": "🧡", "red": "❤️",
+    "sky": "🌌",
 }
 STATE_FILE = Path(__file__).resolve().with_name("stock_state.json")
 # One JSON line per check, for stock_report.py: when which configuration was in which store.

@@ -36,7 +36,13 @@ PRO_MAX = {
     "MJXY4ZA/A": "1TB Silver", "MJXX4ZA/A": "1TB Black", "MJY14ZA/A": "1TB Glacier", "MJY04ZA/A": "1TB Burgundy",
     "MJY34ZA/A": "2TB Silver", "MJY24ZA/A": "2TB Black", "MJY54ZA/A": "2TB Glacier", "MJY44ZA/A": "2TB Burgundy",
 }
+DUO = {
+    "MK2D4ZA/A": "256GB Star White", "MK2E4ZA/A": "256GB Night Sky", "MK2F4ZA/A": "512GB Star White",
+    "MK2G4ZA/A": "512GB Night Sky", "MK2H4ZA/A": "1TB Star White", "MK2J4ZA/A": "1TB Night Sky",
+    "MK2K4ZA/A": "2TB Star White", "MK2L4ZA/A": "2TB Night Sky",
+}
 CATALOG = {p: f"iPhone 18 Pro Max {v}" for p, v in PRO_MAX.items()}
+CATALOG.update({p: f"iPhone Duo {v}" for p, v in DUO.items()})
 PRO = ["MJRP4ZA/A", "MJRQ4ZA/A", "MJRR4ZA/A", "MJRT4ZA/A", "MJRU4ZA/A", "MJRV4ZA/A", "MJRW4ZA/A", "MJRX4ZA/A",
        "MJRY4ZA/A", "MJT04ZA/A", "MJT14ZA/A", "MJT24ZA/A", "MJT34ZA/A"]
 CATALOG.update({p: f"iPhone 18 Pro variant {i}" for i, p in enumerate(PRO)})
@@ -304,16 +310,24 @@ class AlertScenarios(Base):
     def test_missing_config_file_is_fine(self):
         self.cs.load_config()  # no file: nothing happens
 
-    def test_defaults_are_the_12_pro_max_parts(self):
-        self.assertEqual(self.cs.DEFAULT_PART_NUMBERS, list(PRO_MAX))
-        self.assertEqual(self.cs.configured_parts(), list(PRO_MAX))
+    def test_defaults_are_the_12_pro_max_and_8_duo_parts_in_one_request(self):
+        self.assertEqual(self.cs.DEFAULT_PART_NUMBERS, list(PRO_MAX) + list(DUO))
+        self.assertEqual(self.cs.configured_parts(), list(PRO_MAX) + list(DUO))
+        self.assertLessEqual(len(self.cs.DEFAULT_PART_NUMBERS), self.cs.MAX_PARTS_PER_REQUEST)
+        self.world.stock = {("R409", "MK2L4ZA/A"), ("R485", "MJY44ZA/A")}
+        self.assertEqual(self.run_once(), 0)
+        self.assertEqual(self.world.apple_requests, [list(PRO_MAX) + list(DUO)])  # one request for all 20
+        text = self.world.sent()[0]["text"]
+        self.assertIn("iPhone Duo", text)
+        self.assertIn("🌌 2TB · Night Sky", check_html(text))
+        self.assertEqual(self.cs.color_emoji("Star White"), "🤍")
 
     def test_lifecycle(self):
         w = self.world
         w.stock = {("R499", "MJXX4ZA/A")}
         self.assertEqual(self.run_once(), 0)
         self.assertEqual(len(w.apple_requests), 1)
-        self.assertEqual(len(w.apple_requests[0]), 12)
+        self.assertEqual(len(w.apple_requests[0]), 20)
         [msg] = w.sent()
         self.assertEqual(w.telegram_calls[0][0], "123456:SECRET-token")
         self.assertEqual(msg["chat_id"], "987654321")
@@ -324,7 +338,7 @@ class AlertScenarios(Base):
         self.assertIn("<b>🟢 Появились · iPhone 18 Pro Max</b>", msg["text"])
         self.assertNotIn("Canton Road", msg["text"])
         st = self.state()
-        self.assertEqual(st["part_numbers"], list(PRO_MAX))
+        self.assertEqual(st["part_numbers"], list(PRO_MAX) + list(DUO))
         self.assertEqual(st["available"], [{"partNumber": "MJXX4ZA/A", "product": "iPhone 18 Pro Max 1TB Black"}])
         self.assertNotIn("problem", st)
         raw = self.state_raw()
@@ -1321,7 +1335,7 @@ class History(Base):
         self.run_once()
         header, first, second = self.history()
         self.assertEqual(header["watched"][:2], ["iPhone 18 Pro Max 512GB Silver", "iPhone 18 Pro Max 512GB Black"])
-        self.assertEqual(len(header["watched"]), 12)
+        self.assertEqual(len(header["watched"]), 20)
         self.assertEqual(first["time"], "2026-10-03T08:07:00+08:00")  # Apple's clock, Hong Kong time
         self.assertEqual(first["stores"], 6)
         self.assertEqual(first["in_stock"], {
@@ -1543,7 +1557,7 @@ class Report(Base):
         self.world.stock = set()
         self.run_once()
         watched, checks = self.sr.load([self.tmp / "stock_history.jsonl"])
-        self.assertEqual(len(watched), 12)
+        self.assertEqual(len(watched), 20)
         text = self.sr.report(watched, checks)
         self.assertIn("2TB · Silver — 1 раз: с начала наблюдений →", text)
         self.assertIn("Ни разу не появлялись: 512GB · Silver", text)
