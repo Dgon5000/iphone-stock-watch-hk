@@ -193,7 +193,7 @@ class TagChecker(HTMLParser):
         self.text.append(data)
 
 
-FOOTER_RE = re.compile(r"\n\n🕐 Проверено: \d{2}\.\d{2}\.\d{4} \d{2}:\d{2} \(HKT\)(\n🔁 Проверок за \d+ мин: \d+(\n• [^\n]+)*)?$")
+FOOTER_RE = re.compile(r"\n\n🕐 Проверено: \d{2}\.\d{2}\.\d{4} \d{2}:\d{2} \(HKT\)(\n🔁 Проверок за \d+ мин: \d+(\n• [^\n]+)*)?(?=(\n\n#\w+( #\w+)*)?$)")
 
 
 def body(text):
@@ -333,7 +333,7 @@ class AlertScenarios(Base):
         self.assertEqual(msg["chat_id"], "987654321")
         self.assertEqual(msg["parse_mode"], "HTML")
         self.assertEqual(msg["link_preview_options"], {"is_disabled": True})
-        self.assertEqual(body(msg["text"]), "🍏 Apple Store Hong Kong\n\n🟢 Появились · iPhone 18 Pro Max\n🖤 1TB · Black — 🛒 Оформить")
+        self.assertEqual(body(msg["text"]), "🍏 Apple Store Hong Kong\n\n🟢 Появились · iPhone 18 Pro Max\n🖤 1TB · Black — 🛒 Оформить\n\n#iphone18")
         self.assertIn('<a href="https://www.apple.com/hk/shop/product/MJXX4ZA/A">🛒 Оформить</a>', msg["text"])
         self.assertIn("<b>🟢 Появились · iPhone 18 Pro Max</b>", msg["text"])
         self.assertNotIn("Canton Road", msg["text"])
@@ -354,7 +354,7 @@ class AlertScenarios(Base):
         self.assertEqual(self.run_once(), 0)
         self.assertEqual(
             body(w.sent()[1]["text"]),
-            "🍏 Apple Store Hong Kong\n\n🟢 Появились · iPhone 18 Pro Max\n🩶 512GB · Silver — 🛒 Оформить\n\n❤️ 2TB · Burgundy — 🛒 Оформить",
+            "🍏 Apple Store Hong Kong\n\n🟢 Появились · iPhone 18 Pro Max\n🩶 512GB · Silver — 🛒 Оформить\n\n❤️ 2TB · Burgundy — 🛒 Оформить\n\n#iphone18",
         )
 
         # some sell out: confirmed by a second look 20 s later, then reported without links
@@ -375,7 +375,7 @@ class AlertScenarios(Base):
         self.assertEqual(
             body(w.sent()[3]["text"]),
             "🍏 Apple Store Hong Kong\n\n🟢 Появились · iPhone 18 Pro Max\n🩵 2TB · Glacier — 🛒 Оформить\n\n"
-            "🔴 Закончились · iPhone 18 Pro Max\n🖤 1TB · Black",
+            "🔴 Закончились · iPhone 18 Pro Max\n🖤 1TB · Black\n\n#iphone18",
         )
 
         # everything gone, then back
@@ -653,7 +653,7 @@ class AlertScenarios(Base):
         self.world.stock = {("R409", "MJXU4ZA/A"), ("R499", "MJXT4ZA/A")}
         self.assertEqual(self.run_once(), 0)
         [msg] = self.world.sent()  # MJXU4 was known; MJXT4 only "recently gone" in the old format, so it is new
-        self.assertEqual(body(msg["text"]), "🍏 Apple Store Hong Kong\n\n🟢 Появились · iPhone 18 Pro Max\n🖤 512GB · Black — 🛒 Оформить")
+        self.assertEqual(body(msg["text"]), "🍏 Apple Store Hong Kong\n\n🟢 Появились · iPhone 18 Pro Max\n🖤 512GB · Black — 🛒 Оформить\n\n#iphone18")
 
     def test_telegram_error_keeps_state_and_retries(self):
         w = self.world
@@ -725,8 +725,21 @@ class AlertScenarios(Base):
              for color, emoji in (("Silver", "🩶"), ("Black", "🖤"), ("Glacier", "🩵"), ("Burgundy", "❤️"))]
             for cap in ("512GB", "1TB", "2TB")
         ]
-        self.assertEqual(lines[3:], groups[0] + [""] + groups[1] + [""] + groups[2])
+        self.assertEqual(lines[3:], groups[0] + [""] + groups[1] + [""] + groups[2] + ["", "#iphone18"])
         self.assertEqual(msg["text"].count("<a href="), 12)
+
+    def test_appearances_end_with_the_hashtags_of_their_models(self):
+        def item(part):
+            return {"partNumber": part, "product": self.cs.clean(CATALOG[part])}
+        pro, duo = item("MJY14ZA/A"), item("MK2L4ZA/A")
+        parts = list(PRO_MAX) + list(DUO)
+        for appeared, sold_out, tags in (([pro], [], "#iphone18"), ([duo], [pro], "#iphoneDuo"),
+                                         ([duo, pro], [], "#iphone18 #iphoneDuo"), ([], [pro, duo], None)):
+            text = check_html(self.cs.change_message(appeared, sold_out, parts))
+            if tags:
+                self.assertTrue(text.endswith("(HKT)\n\n" + tags), text[-60:])
+            else:
+                self.assertNotIn("#", text)
 
     def test_html_is_escaped(self):
         CATALOG["MJXU4ZA/A"], saved = "iPhone <18> & Co 512GB Silver", CATALOG["MJXU4ZA/A"]
@@ -877,7 +890,7 @@ class TestMessage(Base):
             self.assertEqual(self.run_once(), 0)
             self.cs.send_test_message(list(PRO_MAX))
         for msg in self.world.sent():
-            self.assertTrue(check_html(msg["text"]).endswith("\n\n🕐 Проверено: 03.10.2026 00:05 (HKT)"), msg["text"][-60:])
+            self.assertTrue(re.sub(r"\n\n#iphone18$", "", check_html(msg["text"])).endswith("\n\n🕐 Проверено: 03.10.2026 00:05 (HKT)"), msg["text"][-60:])
 
     def test_footer_uses_apples_clock_not_the_servers(self):
         class Skewed(datetime):  # this computer's clock is an hour off
@@ -892,7 +905,7 @@ class TestMessage(Base):
             self.run_once()
             self.cs.send_test_message(list(PRO_MAX))
         for msg in self.world.sent():
-            self.assertTrue(check_html(msg["text"]).endswith("🕐 Проверено: 02.10.2026 15:59 (HKT)"), msg["text"][-50:])
+            self.assertTrue(re.sub(r"\n\n#iphone18$", "", check_html(msg["text"])).endswith("🕐 Проверено: 02.10.2026 15:59 (HKT)"), msg["text"][-50:])
 
     def test_test_message_when_apple_fails(self):
         self.world.apple_errors = [HTTPError("u", 541, "x", {}, io.BytesIO(b""))]

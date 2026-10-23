@@ -187,6 +187,9 @@ COLOR_EMOJI = {
     "green": "💚", "sage": "💚", "lavender": "💜", "purple": "💜", "orange": "🧡", "red": "❤️",
     "sky": "🌌",
 }
+# A "Появились" alert ends with the hashtag of each model that came into stock (model name
+# prefix, tag), so that tapping it in Telegram lists all such alerts of that model.
+MODEL_HASHTAGS = (("iPhone 18", "#iphone18"), ("iPhone Duo", "#iphoneDuo"))
 STATE_FILE = Path(__file__).resolve().with_name("stock_state.json")
 # One JSON line per check, for stock_report.py: when which configuration was in which store.
 HISTORY_FILE = Path(__file__).resolve().with_name("stock_history.jsonl")
@@ -641,6 +644,13 @@ def checked_at(moment=None):
     return f"🕐 Проверено: {(moment or utc_now()).astimezone(HKT):%d.%m.%Y %H:%M} (HKT)"
 
 
+def model_hashtags(items):
+    """Hashtags of the models among `items`, e.g. "#iphone18 #iphoneDuo": tapped in Telegram,
+    one lists every message where that model came into stock."""
+    models = {" ".join(describe(item["product"])[0].split()) for item in items}
+    return " ".join(tag for prefix, tag in MODEL_HASHTAGS if any(m.startswith(prefix) for m in models))
+
+
 def change_message(appeared, sold_out, parts, moment=None):
     order = {part: i for i, part in enumerate(parts)}
 
@@ -653,6 +663,8 @@ def change_message(appeared, sold_out, parts, moment=None):
     if sold_out:
         blocks += config_blocks(in_watch_order(sold_out), None, "🔴 Закончились ·")
     blocks.append(checked_at(moment))
+    if model_hashtags(appeared):
+        blocks.append(model_hashtags(appeared))
     return "\n\n".join(blocks)
 
 
