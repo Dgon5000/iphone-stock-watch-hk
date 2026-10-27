@@ -1657,3 +1657,44 @@ class Installer(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class WatchdogPings(ProbeBase):
+    """Under systemd with WatchdogSec the loops say they are alive, so that a stuck one is restarted."""
+
+    def test_alive_tells_the_notify_socket_at_most_every_10_s(self):
+        import socket
+        folder = tempfile.mkdtemp(dir="/tmp")
+        self.addCleanup(shutil.rmtree, folder, True)
+        path = os.path.join(folder, "notify")
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        server.bind(path)
+        server.settimeout(1)
+        self.addCleanup(server.close)
+        with mock.patch.dict(os.environ, {"NOTIFY_SOCKET": path}):
+            self.cs.alive()
+            self.cs.alive()  # too soon: nothing
+            self.clock.now += 10
+            self.cs.alive()
+        self.assertEqual([server.recv(64), server.recv(64)], [b"WATCHDOG=1", b"WATCHDOG=1"])
+        server.setblocking(False)
+        with self.assertRaises(BlockingIOError):
+            server.recv(64)
+
+    def test_a_probe_says_it_is_alive_every_10_s_also_while_apple_makes_it_pause(self):
+        pings = []
+        self.world.apple_errors = [HTTPError("u", 541, "x", {}, io.BytesIO(b""))]
+        with mock.patch.dict(os.environ, {"NOTIFY_SOCKET": "/nonexistent"}), \
+                mock.patch.object(self.cs, "alive", lambda: pings.append(self.clock.now)):
+            self.assertEqual(self.probe(minutes=8), 0)
+        self.assertEqual(len(self.world.request_times), 5)  # 10:00:30 refused, 4 min pause, then 10:04:30 to 10:07:30
+        self.assertGreater(len(pings), 40)
+        gaps = [b - a for a, b in zip(pings, pings[1:])]
+        self.assertLessEqual(max(gaps), 10.001)
+        self.assertGreaterEqual(pings[-1] - pings[0], 7 * 60)
+
+    def test_without_systemd_a_nap_is_one_sleep(self):
+        with mock.patch.dict(os.environ, {"NOTIFY_SOCKET": ""}):
+            start = self.clock.now
+            self.cs.nap(135)
+        self.assertEqual(self.clock.now - start, 135)

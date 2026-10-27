@@ -113,6 +113,10 @@ STATUS_SEND_WAIT = 3
 # day), so connecting is given up already after TELEGRAM_CONNECT_TIMEOUT: the fresh connection
 # then works at once. Nothing has been sent yet at that point, so no message can come twice.
 TELEGRAM_CONNECT_TIMEOUT = 3
+# Under systemd the loops tell it they are alive this often (see alive()); the services'
+# WatchdogSec (300 s) restarts one whose loop has said nothing for that long.
+ALIVE_EVERY = 10
+_last_alive = -math.inf
 # When Apple refuses requests (HTTP 403, 429, or 541 — Apple's own "too many requests from
 # this address"), the computer pauses its checks for 4, 8 and then at most 15 minutes
 # instead of insisting. (Apple goes on refusing an address for well over 10 minutes: a retry
@@ -1538,6 +1542,39 @@ class Standby(Watcher):
                  f"Проверку и отправку уведомлений продолжает {source_name(self.source)}.")
 
 
+def alive():
+    """Tell systemd that this process still goes round its loop (WATCHDOG=1), at most every
+    ALIVE_EVERY seconds. With WatchdogSec in the unit, a loop stuck longer than that (seen once
+    for hours on a probe) gets the service restarted. Nothing outside systemd."""
+    global _last_alive
+    path = os.environ.get("NOTIFY_SOCKET")
+    if not path or time.time() - _last_alive < ALIVE_EVERY:
+        return
+    _last_alive = time.time()
+    if path.startswith("@"):  # an abstract socket
+        path = "\0" + path[1:]
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as sock:
+            sock.connect(path)
+            sock.sendall(b"WATCHDOG=1")
+    except OSError:
+        pass
+
+
+def nap(seconds):
+    """time.sleep that keeps telling systemd this process is alive (see alive())."""
+    if not os.environ.get("NOTIFY_SOCKET"):
+        time.sleep(seconds)
+        return
+    end = time.time() + seconds
+    while True:
+        alive()
+        left = end - time.time()
+        if left <= 0:
+            return
+        time.sleep(min(left, ALIVE_EVERY))
+
+
 def run_slots(parts, every, offset, dry_run, status_minutes=0, inbox=None, source="vps", standby_of=None,
               participate=False):
     """Check at fixed times on the clock, `offset` seconds past every multiple of `every`
@@ -1562,6 +1599,7 @@ def run_slots(parts, every, offset, dry_run, status_minutes=0, inbox=None, sourc
     last_request = -math.inf  # this computer's last own request to Apple
     asking = None  # this computer's own check until Apple answers it
     while True:
+        alive()
         if inbox:
             watcher.take_inbox(inbox)
         if asking is not None and asking.done():  # after the checks handed in meanwhile, which are older
@@ -1595,7 +1633,7 @@ def run_slots(parts, every, offset, dry_run, status_minutes=0, inbox=None, sourc
             due = next_slot(time.time(), *plan)
         else:
             wait = min(due, sync_due) - now
-            time.sleep(min(wait, INBOX_POLL_SECONDS) if inbox or asking is not None else wait)
+            nap(min(wait, INBOX_POLL_SECONDS) if inbox or asking is not None else wait)
 
 
 def check_to_json(source, result=None, error=None, moment=None):
@@ -1868,7 +1906,7 @@ def run_probe(parts, feed, every, offset, minutes=0, source="github", backup=Non
             due = next_slot(due, *mine)
         if end is not None and due >= end:
             return 0
-        time.sleep(max(0.0, due - time.time()))
+        nap(max(0.0, due - time.time()))
         if not backoff.allows(due):
             continue
         last_request = time.time()
